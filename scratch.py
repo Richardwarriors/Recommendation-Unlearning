@@ -14,6 +14,7 @@ from utils import WMF, DMF, NeuMF, BPR
 class Scratch(object):
     def __init__(self, param, model_type):
         # model param
+        self.param = param
         self.n_user = param.n_user
         self.n_item = param.n_item
         self.k = param.k
@@ -157,7 +158,7 @@ class Scratch(object):
         print('-------best--------')
 
         # ===== save best model =====
-        save_dir = f'results/best_{self.model_type}_{self.n_user}_{self.n_item}'
+        save_dir = f'results/best_{self.model_type}_{self.param.dataset}_{self.param.learn_type}_{self.param.del_type}_{self.param.del_per}'
         os.makedirs(save_dir, exist_ok=True)
 
         if best_model_state is not None:
@@ -179,8 +180,8 @@ class Scratch(object):
             for iid in range(item_np.shape[0]):
                 item_dict[np.int64(iid)] = item_np[iid:iid+1]
 
-            np.save(os.path.join(save_dir, 'ml-1m_neumf_best_user_emb.npy'), user_dict)
-            np.save(os.path.join(save_dir, 'ml-1m_neumf_best_item_emb.npy'), item_dict)
+            np.save(os.path.join(save_dir, f'{self.model_type}_{self.param.dataset}_{self.param.learn_type}_{self.param.del_type}_{self.param.del_per}_best_user_emb.npy'), user_dict)
+            np.save(os.path.join(save_dir, f'{self.model_type}_{self.param.dataset}_{self.param.learn_type}_{self.param.del_type}_{self.param.del_per}_best_item_emb.npy'), item_dict)
 
             print("Best embeddings saved.")
 
