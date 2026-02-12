@@ -11,22 +11,48 @@ from torch.utils.data.dataset import Dataset
 
 from utils import kmeans, ot_cluster
 
-#interaction delete 
-def delete(ratings, del_type, del_per):
+def delete(ratings, del_type, del_per, min_inter_per_user=2):
+
+    #np.random.seed(42)
+
+    total_interactions = len(ratings)
+    num_delete = int(total_interactions * del_per / 100)
+
+    #user interactions count    
+    user_counts = ratings['user'].value_counts()
+
     if del_type == 'random':
-        np.random.seed(42)
-        user_counts = ratings['user'].value_counts()
-        num_delete_users = int(len(user_counts) * del_per / 100)
-        delete_users = np.random.choice(user_counts.index, num_delete_users, replace=False).tolist()
+        target_users = user_counts.index.tolist()
+
     elif del_type == 'core':
-        user_counts = ratings['user'].value_counts()
-        num_delete_users = int(len(user_counts) * del_per / 100)
-        delete_users = user_counts.index[:num_delete_users].tolist()
+        # top 5% user
+        num_active = int(len(user_counts) * 0.05)
+        target_users = user_counts.sort_values(ascending=False).index[:num_active]
+
     elif del_type == 'edge':
-        user_counts = ratings['user'].value_counts(ascending=True)
-        num_delete_users = int(len(user_counts) * del_per / 100)
-        delete_users = user_counts.index[:num_delete_users].tolist()
-    return delete_users
+        # bottom 95% user
+        num_active = int(len(user_counts) * 0.05)
+        target_users = user_counts.sort_values(ascending=False).index[num_active:]
+
+    else:
+        raise ValueError("Unknown del_type")
+
+    #delete interactions 
+    deletable_idx = []
+
+    for user in target_users:
+        user_idx = ratings[ratings['user'] == user].index.tolist()
+        max_delete = len(user_idx) - min_inter_per_user
+
+        if max_delete > 0:
+            deletable_idx.extend(user_idx[:max_delete])
+
+    #random delete interactions from deletable_idx
+
+    num_delete = min(num_delete, len(deletable_idx))
+    delete_idx = np.random.choice(deletable_idx, num_delete, replace=False)
+
+    return ratings.drop(index=delete_idx).reset_index(drop=True)
 
 
 def readRating_full(train_dir, test_dir, del_type='random', del_per=5):
@@ -36,11 +62,10 @@ def readRating_full(train_dir, test_dir, del_type='random', del_per=5):
     test_ratings = pd.read_csv(test_dir, sep=',')
     test_ratings['rating'] = 1
 
-    if del_per > 0:
-        del_user = delete(train_ratings, del_type, del_per)
 
-        train_ratings = train_ratings[~train_ratings['user'].isin(del_user)].reset_index(drop=True)
-        test_ratings = test_ratings[~test_ratings['user'].isin(del_user)].reset_index(drop=True)
+    if del_per > 0:
+        train_ratings = delete(train_ratings, del_type, del_per, min_inter_per_user=2)
+
     # active and inactive
     user_counts = train_ratings['user'].value_counts()
 
