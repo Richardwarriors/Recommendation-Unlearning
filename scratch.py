@@ -140,7 +140,7 @@ class Scratch(object):
             else:
                 count_dec += 1
 
-            if count_dec > 5:
+            if count_dec > 10:
                 break
 
         if active_test_data is not None:
@@ -150,10 +150,15 @@ class Scratch(object):
         else:
             active_ndcg = 0
             active_hr = 0
-        inactive_ndcg, inactive_hr = baseTest(inactive_test_data, model, self.loss_fn, self.device, verbose,
+        
+        if inactive_test_data is not None:
+            inactive_ndcg, inactive_hr = baseTest(inactive_test_data, model, self.loss_fn, self.device, verbose,
                                               pos_dict,
                                               self.n_item,
                                               10,user_mapping,pos_mapping)
+        else:
+            inactive_ndcg = 0
+            inactive_hr = 0
         print('inactive_test_ndcg:', inactive_ndcg)
         print('-------best--------')
 
