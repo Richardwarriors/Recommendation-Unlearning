@@ -88,15 +88,17 @@ def readRating_full(train_dir, test_dir, del_type='random', del_per=5):
 
 
 def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_type='sisa', num_groups=5,
-                     dataset='ml-100k'):
+                     dataset='ml-1m'):
     train_ratings = pd.read_csv(train_dir, sep=',')
+    train_ratings['rating'] = 1
     test_ratings = pd.read_csv(test_dir, sep=',')
+    test_ratings['rating'] = 1
 
     if del_per > 0:
-        del_user = delete(train_ratings, del_type, del_per)
+        train_ratings = delete(train_ratings, del_type, del_per, min_inter_per_user=2)
 
-        train_ratings = train_ratings[~train_ratings['user'].isin(del_user)].reset_index(drop=True)
-        test_ratings = test_ratings[~test_ratings['user'].isin(del_user)].reset_index(drop=True)
+    ensemble_test = [test_ratings['user'], test_ratings['item'], test_ratings['rating']]
+
     # active and inactive
     user_counts = train_ratings['user'].value_counts()
     num_active_users = int(len(user_counts) * 5 / 100)
@@ -104,12 +106,13 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
     active_users = user_counts.index[:num_active_users].tolist()
     inactive_users = user_counts.index[num_active_users:].tolist()
 
-    if learn_type == 'sisa':
+    if learn_type == 'sisa_ubp':
 
         unique_users = train_ratings['user'].unique()
         random.shuffle(unique_users)
 
         group_size = len(unique_users) // num_groups
+        #average shard
         user_groups = [unique_users[i * group_size: (i + 1) * group_size] for i in range(num_groups)]
 
         if len(unique_users) % num_groups != 0:
@@ -120,6 +123,39 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
                                user_groups]
         test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
                               user_groups]
+    elif learn_type == 'sisa':
+        #shuffle interaction
+        train_ratings = train_ratings.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        total_inter = len(train_ratings)
+        shard_size = total_inter // num_groups
+
+        train_rating_groups = []
+        test_rating_groups = []
+
+        for i in range(num_groups):
+
+            start = i * shard_size
+
+            if i == num_groups - 1:
+                end = total_inter
+            else:
+                end = (i + 1) * shard_size
+
+            #interaction average shard
+            train_g = train_ratings.iloc[start:end].reset_index(drop=True)
+
+            #user in shard
+            shard_users = train_g['user'].unique()
+
+            #user in the shard test
+            test_g = test_ratings[
+                test_ratings['user'].isin(shard_users)
+            ].reset_index(drop=True)
+
+            train_rating_groups.append(train_g)
+            test_rating_groups.append(test_g)
+            
     #user embedding clustering
     elif learn_type == 'receraser':
         start_time = time.time()
@@ -178,7 +214,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
     active_groups = [[ratings['user'], ratings['item'], ratings['rating']] for ratings in active_groups]
     inactive_groups = [[ratings['user'], ratings['item'], ratings['rating']] for ratings in inactive_groups]
 
-    return train_rating_groups, test_rating_groups, active_groups, inactive_groups
+    return train_rating_groups, test_rating_groups, active_groups, inactive_groups, ensemble_test
 
 
 class RatingData(Dataset):
