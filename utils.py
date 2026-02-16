@@ -1,10 +1,12 @@
 import pickle
 import random
+import time
 
 import numpy as np
 import ot
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 STD = 0.01
 
@@ -337,6 +339,80 @@ def spTrick(model, shrink=0.5, sigma=0.01):
     return model
 
 
+
+#RecEraser Ebsembling model
+def RecEraserTest_ensemble(dataloader, models, device, pos_dict, n_items, top_k=10):
+
+    for m in models:
+        m.eval()
+
+    num_shards = len(models)
+    emb_dim = models[0].user_mat_mlp.weight.shape[1] + models[0].user_mat_mf.weight.shape[1]
+
+    aggregator = RecEraserAggregator(emb_dim, num_shards).to(device)
+    aggregator.eval()
+
+    full_items = list(range(n_items))
+
+    HR = []
+    NDCG = []
+
+    with torch.no_grad():
+
+        for user, item, rating in dataloader:
+
+            user = user.to(device)
+            item = item.to(device)
+
+            all_users = user.unique()
+
+            for uid in all_users:
+
+                user_id = uid.item()
+                user_indices = torch.where(user == uid)
+                gt_items = item[user_indices].cpu().numpy().tolist()
+
+                neg_pool = list(set(full_items) - set(pos_dict[user_id]))
+                neg_items = random.sample(neg_pool, 99)
+
+                candidates = gt_items + neg_items
+
+                new_user = torch.tensor([user_id] * len(candidates), dtype=torch.long).to(device)
+                new_item = torch.tensor(candidates, dtype=torch.long).to(device)
+
+                # ===== collect shard embeddings =====
+                user_embs = []
+                item_embs = []
+
+                for m in models:
+
+                    u_mlp = m.user_mat_mlp(new_user)
+                    u_mf = m.user_mat_mf(new_user)
+                    u_emb = torch.cat([u_mlp, u_mf], dim=1)
+
+                    i_mlp = m.item_mat_mlp(new_item)
+                    i_mf = m.item_mat_mf(new_item)
+                    i_emb = torch.cat([i_mlp, i_mf], dim=1)
+
+                    user_embs.append(u_emb.unsqueeze(1))
+                    item_embs.append(i_emb.unsqueeze(1))
+
+                user_embs = torch.cat(user_embs, dim=1)
+                item_embs = torch.cat(item_embs, dim=1)
+
+                # ===== attention aggregation =====
+                u_agg, i_agg = aggregator(user_embs, item_embs)
+
+                scores = torch.sum(u_agg * i_agg, dim=1)
+
+                _, indices = torch.topk(scores, top_k)
+                recommends = torch.take(new_item, indices).cpu().numpy().tolist()
+
+                HR.append(hit(gt_items, recommends))
+                NDCG.append(ndcg(gt_items, recommends))
+
+    return np.mean(NDCG), np.mean(HR)
+
 ##################### 
 # object saving
 ##################### 
@@ -351,8 +427,230 @@ def loadObject(filename):
         obj = pickle.load(input)
     return obj
 
+def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_iters=30):
+    """
+    Interaction-based Balanced Partition (RecEraser InBP)
+    Returns:
+        train_rating_groups
+        test_rating_groups
+    """
 
-def kmeans(X, k, balance=False, max_iters=10):
+    start_time = time.time()
+
+    # ===== load embeddings =====
+    user_emb = np.load(
+        f'results/user_emb/{dataset}_{model_type}_user_emb.npy',
+        allow_pickle=True
+    ).item()
+
+    item_emb = np.load(
+        f'results/item_emb/{dataset}_{model_type}_item_emb.npy',
+        allow_pickle=True
+    ).item()
+
+    # ===== build interaction list =====
+    data = []
+    for _, row in train_ratings.iterrows():
+        data.append((int(row['user']), int(row['item'])))
+
+    n = len(data)
+    k = num_groups
+    max_data = int(np.ceil(1.2 * n / k))
+
+    # ===== randomly initialize anchors =====
+    centroids = random.sample(data, k)
+
+    centroembs = []
+    for u, i in centroids:
+        pu = user_emb[np.int64(u)][0]
+        qi = item_emb[np.int64(i)][0]
+        centroembs.append((pu, qi))
+
+    # ===== main loop =====
+    for _ in range(max_iters):
+
+        C = [{} for _ in range(k)]
+        C_num = [0] * k
+        Scores = {}
+
+        # compute distance
+        for idx, (u, i) in enumerate(data):
+
+            pu = user_emb[np.int64(u)][0]
+            qi = item_emb[np.int64(i)][0]
+
+            for j in range(k):
+                cu, ci = centroembs[j]
+
+                dist_u = np.sum((pu - cu) ** 2)
+                dist_i = np.sum((qi - ci) ** 2)
+
+                Scores[(idx, j)] = -(dist_u * dist_i)
+
+        Scores = sorted(Scores.items(),
+                        key=lambda x: x[1],
+                        reverse=True)
+
+        assigned = set()
+
+        for (idx, shard_id), _ in Scores:
+
+            if idx in assigned:
+                continue
+
+            if C_num[shard_id] >= max_data:
+                continue
+
+            u, i = data[idx]
+
+            if u not in C[shard_id]:
+                C[shard_id][u] = [i]
+            else:
+                C[shard_id][u].append(i)
+
+            C_num[shard_id] += 1
+            assigned.add(idx)
+
+            if len(assigned) == n:
+                break
+
+        # ===== update anchors =====
+        new_centroembs = []
+
+        for shard_id in range(k):
+
+            temp_u = []
+            temp_i = []
+
+            for u in C[shard_id]:
+                for i in C[shard_id][u]:
+                    temp_u.append(user_emb[np.int64(u)][0])
+                    temp_i.append(item_emb[np.int64(i)][0])
+
+            if len(temp_u) == 0:
+                new_centroembs.append(centroembs[shard_id])
+            else:
+                new_centroembs.append((
+                    np.mean(temp_u, axis=0),
+                    np.mean(temp_i, axis=0)
+                ))
+
+        if all(np.allclose(new_centroembs[i][0], centroembs[i][0]) and
+               np.allclose(new_centroembs[i][1], centroembs[i][1])
+               for i in range(k)):
+            break
+
+        centroembs = new_centroembs
+
+    # ===== build shard datasets =====
+    train_rating_groups = []
+    test_rating_groups = []
+
+    for shard_id in range(k):
+
+        shard_users = list(C[shard_id].keys())
+
+        train_group = train_ratings[
+            train_ratings['user'].isin(shard_users)
+        ].reset_index(drop=True)
+
+        test_group = test_ratings[
+            test_ratings['user'].isin(shard_users)
+        ].reset_index(drop=True)
+
+        train_rating_groups.append(train_group)
+        test_rating_groups.append(test_group)
+
+    print(f'Grouping time: {time.time() - start_time}')
+
+    return train_rating_groups, test_rating_groups
+
+
+def ot_cluster(X, k, max_iters=10):
+    # Initialize centroids randomly
+    n, _ = X.shape
+    centroid = X[np.random.choice(n, size=k, replace=False)]
+
+    # Iterate until convergence or maximum iterations
+
+    for _ in range(max_iters):
+        # compute distance
+        dist = ((X - centroid[:, np.newaxis]) ** 2).sum(axis=2)  # [k, n]
+
+        # print(dist.shape)
+        inertia = np.min(dist, axis=0).sum()
+
+        # compute sinkhorn distance
+        lam = 1e-3
+        a = np.ones(n) / n
+        b = np.ones(k) / k
+        # b = np.array([0.1, 0.2, 0.3, 0.4])
+
+        trans = ot.emd(a, b, dist.T, lam)
+
+        # Update centroids to the mean of assigned samples
+        label = np.argmax(trans, axis=1)
+        new_centroid = np.array([X[label == i].mean(axis=0) for i in range(k)])
+
+        # Check if centroids have converged
+        if np.allclose(centroid, new_centroid):
+            break
+
+        centroid = new_centroid
+    return inertia, label  # , centroids
+
+class RecEraserAggregator(nn.Module):
+    def __init__(self, emb_dim, num_shards, att_dim=64):
+        super().__init__()
+
+        self.emb_dim = emb_dim
+        self.num_shards = num_shards
+        self.att_dim = att_dim
+
+        # transfer layer W^i
+        self.trans_W = nn.Parameter(torch.randn(num_shards, emb_dim, emb_dim))
+        self.trans_b = nn.Parameter(torch.zeros(num_shards, emb_dim))
+
+        # user attention
+        self.WA = nn.Linear(emb_dim, att_dim)
+        self.HA = nn.Linear(att_dim, 1)
+
+        # item attention
+        self.WB = nn.Linear(emb_dim, att_dim)
+        self.HB = nn.Linear(att_dim, 1)
+
+    def attention(self, embs, flag):
+        # embs shape: [batch, num_shards, emb_dim]
+
+        if flag == 0:
+            x = torch.relu(self.WA(embs))
+            score = self.HA(x)
+        else:
+            x = torch.relu(self.WB(embs))
+            score = self.HB(x)
+
+        weight = torch.softmax(score, dim=1)
+        agg_emb = torch.sum(weight * embs, dim=1)
+
+        return agg_emb, weight
+
+    def forward(self, user_embs, item_embs):
+        """
+        user_embs: [batch, num_shards, emb_dim]
+        item_embs: [batch, num_shards, emb_dim]
+        """
+
+        # transfer each shard to shared space
+        u_trans = torch.einsum('bsd,sdh->bsh', user_embs, self.trans_W) + self.trans_b
+        i_trans = torch.einsum('bsd,sdh->bsh', item_embs, self.trans_W) + self.trans_b
+
+        u_agg, u_w = self.attention(u_trans, flag=0)
+        i_agg, i_w = self.attention(i_trans, flag=1)
+
+        return u_agg, i_agg
+    
+'''
+def kmeans_UBP(X, k, balance=False, max_iters=10):
     # Initialize centroids randomly
     n, _ = X.shape
     group_len = int(np.ceil(n / k))
@@ -409,38 +707,4 @@ def kmeans(X, k, balance=False, max_iters=10):
 
     print(f'{inertia:.3f}', end=' ')
     return inertia, label  # , centroid
-
-
-def ot_cluster(X, k, max_iters=10):
-    # Initialize centroids randomly
-    n, _ = X.shape
-    centroid = X[np.random.choice(n, size=k, replace=False)]
-
-    # Iterate until convergence or maximum iterations
-
-    for _ in range(max_iters):
-        # compute distance
-        dist = ((X - centroid[:, np.newaxis]) ** 2).sum(axis=2)  # [k, n]
-
-        # print(dist.shape)
-        inertia = np.min(dist, axis=0).sum()
-
-        # compute sinkhorn distance
-        lam = 1e-3
-        a = np.ones(n) / n
-        b = np.ones(k) / k
-        # b = np.array([0.1, 0.2, 0.3, 0.4])
-
-        trans = ot.emd(a, b, dist.T, lam)
-
-        # Update centroids to the mean of assigned samples
-        label = np.argmax(trans, axis=1)
-        new_centroid = np.array([X[label == i].mean(axis=0) for i in range(k)])
-
-        # Check if centroids have converged
-        if np.allclose(centroid, new_centroid):
-            break
-
-        centroid = new_centroid
-    return inertia, label  # , centroids
-
+'''
