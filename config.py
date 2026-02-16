@@ -6,7 +6,7 @@ from os.path import abspath, join, dirname, exists
 import numpy as np
 import torch
 from scratch import Scratch
-from utils import SISATest_ensemble, saveObject
+from utils import RecEraserTest_ensemble, SISATest_ensemble, saveObject
 
 from read import RatingData, PairData
 from read import loadData, readRating_full, readRating_group
@@ -95,7 +95,7 @@ class Instance(object):
             warnings.simplefilter('ignore')
             # np.save(param_dir + '/deletion', deletion)  # np.load('deletion.npy')
 
-    def read(self):
+    def read(self,model_type='wmf'):
         learn_type = self.param.learn_type
         del_type = self.param.del_type
         del_per = self.param.del_per
@@ -104,18 +104,22 @@ class Instance(object):
             train_rating, test_rating, active_rating, inactive_rating = readRating_full(self.param.train_dir,
                                                                                         self.param.test_dir, 
                                                                                         del_type, del_per)
+            return train_rating, test_rating, active_rating, inactive_rating
         else:
             train_rating, test_rating, active_rating, inactive_rating, ensemble_test = readRating_group(self.param.train_dir,
                                                                                          self.param.test_dir, del_type,
                                                                                          del_per, learn_type, group,
-                                                                                         self.param.dataset)
+                                                                                         self.param.dataset, model_type)
 
-        return train_rating, test_rating, active_rating, inactive_rating, ensemble_test
+            return train_rating, test_rating, active_rating, inactive_rating, ensemble_test
 
     def runModel(self, model_type='wmf', verbose=2):
         print(self.name, 'begin:')
         # read raw data
-        train_rating, test_rating, active_rating, inactive_rating, ensemble_test = self.read()
+        if self.param.learn_type == 'retrain':
+            train_rating, test_rating, active_rating, inactive_rating = self.read(model_type)
+        else:
+            train_rating, test_rating, active_rating, inactive_rating, ensemble_test = self.read(model_type)
 
         if self.param.learn_type == 'retrain':
             # load data
@@ -240,7 +244,92 @@ class Instance(object):
 
             print("Final SISA HR:", hr)
             print("Final SISA NDCG:", ndcg)
+
+        elif self.param.learn_type == 'receraser':
+
+            group = self.param.n_group
+            shard_model_paths = []
+
+            for i in range(group):
+
+                print(f"Training shard {i+1}/{group}")
+                # load data
+                if model_type in ['wmf', 'dmf', 'neumf']:
+                    train_data = loadData(RatingData(train_rating[i]), self.param.batch,
+                                          self.param.n_worker,
+                                          True)
+                elif model_type in ['bpr', 'lightgcn']:
+                    train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
+                                          self.param.n_worker,
+                                          True)
+
+                test_data = loadData(RatingData(test_rating[i]), len(test_rating[i][0]), self.param.n_worker, False)
+                if len(active_rating[i][0]) > 0:
+                    active_test_data = loadData(RatingData(active_rating[i]), len(active_rating[i][0]),
+                                                self.param.n_worker,
+                                                False)
+                else:
+                    active_test_data = None
+                inactive_test_data = loadData(RatingData(inactive_rating[i]), len(inactive_rating[i][0]),
+                                              self.param.n_worker,
+                                              False)
+                
+                model = Scratch(self.param, model_type)
+                #model, result = model.train(train_data,test_data,None,None,verbose)
+                model, result = model.train(train_data, test_data, active_test_data, inactive_test_data, verbose,
+                                            given_model='')
+
+                result.update({'model': model_type, 'dataset': self.param.dataset, 'deltype': self.param.del_type,
+                               'method': self.param.learn_type, 'group': i + 1})
+                
+                save_dir = f'results/{self.param.learn_type}'
+                os.makedirs(save_dir, exist_ok=True)   
+                file_name = f'group{i + 1}_{self.param.n_group}_{model_type}_{self.param.dataset}_{self.param.del_type}_{self.param.del_per}.pth'
+                model_path = os.path.join(save_dir, file_name)
+
+                torch.save(model.state_dict(), model_path)
+                shard_model_paths.append(model_path)
+
+                #np.save(save_path, result)
+                
+                print(f'End of Group {str(i + 1)} / {group} training', self.name)
+
         
+
+            # ==========================
+            # RecEraser ensemble testing: load all shard models and test on the full test set (not split by group)
+            # ==========================
+            print("Start ensemble testing...")
+
+            models = []
+
+            for path in shard_model_paths:
+
+                if model_type == 'neumf':
+                    m = NeuMF(self.param.n_user,
+                            self.param.n_item,
+                            self.param.k,
+                            self.param.layers)
+                else:
+                    ...
+                state_dict = torch.load(path, map_location=device, weights_only=True)
+                m.load_state_dict(state_dict)
+
+                m.to(device)
+                m.eval()
+
+                models.append(m)
+
+            #
+            full_test_data = loadData(RatingData(ensemble_test),len(ensemble_test[0]),self.param.n_worker,False)
+
+            pos_dict = np.load(self.param.pos_data,
+                            allow_pickle=True).item()
+
+            ndcg, hr = RecEraserTest_ensemble(full_test_data,models,device,pos_dict,self.param.n_item,top_k=10)
+
+            print("Final ReEraser HR:", hr)
+            print("Final ReEraser NDCG:", ndcg)
         else:
             group = self.param.n_group
             for i in range(group):
