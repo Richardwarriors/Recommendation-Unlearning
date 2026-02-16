@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 
-from utils import kmeans, ot_cluster
+from utils import kmeans_InBP, ot_cluster
 
 def delete(ratings, del_type, del_per, min_inter_per_user=2):
 
@@ -88,7 +88,8 @@ def readRating_full(train_dir, test_dir, del_type='random', del_per=5):
 
 
 def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_type='sisa', num_groups=5,
-                     dataset='ml-1m'):
+                     dataset='ml-1m', model_type='wmf'):
+    
     train_ratings = pd.read_csv(train_dir, sep=',')
     train_ratings['rating'] = 1
     test_ratings = pd.read_csv(test_dir, sep=',')
@@ -106,24 +107,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
     active_users = user_counts.index[:num_active_users].tolist()
     inactive_users = user_counts.index[num_active_users:].tolist()
 
-    if learn_type == 'sisa_ubp':
-
-        unique_users = train_ratings['user'].unique()
-        random.shuffle(unique_users)
-
-        group_size = len(unique_users) // num_groups
-        #average shard
-        user_groups = [unique_users[i * group_size: (i + 1) * group_size] for i in range(num_groups)]
-
-        if len(unique_users) % num_groups != 0:
-            for i in range(len(unique_users) % num_groups):
-                user_groups[i] = np.append(user_groups[i], unique_users[num_groups * group_size + i])
-
-        train_rating_groups = [train_ratings[train_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                               user_groups]
-        test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                              user_groups]
-    elif learn_type == 'sisa':
+    if learn_type == 'sisa':
         #shuffle interaction
         train_ratings = train_ratings.sample(frac=1, random_state=42).reset_index(drop=True)
 
@@ -158,25 +142,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
             
     #user embedding clustering
     elif learn_type == 'receraser':
-        start_time = time.time()
-        #user_embeddings = [[][]]
-        user_embeddings = np.load(f'results/user_emb/{dataset}_wmf_emb.npy', allow_pickle=True).item()
-        unique_users = train_ratings['user'].unique()
-        #item_embeddings = np.load(f'results/item_emb/{dataset}_wmf_emb.npy', allow_pickle=True).item()
-        user_mat = np.array([user_embeddings[user_id][0] for user_id in unique_users])
-
-        _, labels = kmeans(user_mat, num_groups, True, 30)
-
-        user_groups = [[] for _ in range(num_groups)]
-        for user_id, label in zip(unique_users, labels):
-            user_groups[int(label)].append(user_id)
-
-        train_rating_groups = [train_ratings[train_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                               user_groups]
-        test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                              user_groups]
-
-        print(f'Grouping time: {time.time() - start_time}')
+        train_rating_groups, test_rating_groups = kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type)
 
     elif learn_type == 'ultrare':
         start_time = time.time()
@@ -350,3 +316,45 @@ def readSparseMat(dir, n_user, n_item, max_rating=5):
     # ind_mat = coo_matrix((ind, (row, col)), shape=(n_user, n_item), dtype=np.float16)  # set to float! int will cause error in kmeans
 
     return val_mat.tocsr()  # , ind_mat.tocsr()
+
+
+'''
+if learn_type == 'sisa':
+
+    unique_users = train_ratings['user'].unique()
+    random.shuffle(unique_users)
+
+    group_size = len(unique_users) // num_groups
+    #average shard
+    user_groups = [unique_users[i * group_size: (i + 1) * group_size] for i in range(num_groups)]
+
+    if len(unique_users) % num_groups != 0:
+        for i in range(len(unique_users) % num_groups):
+            user_groups[i] = np.append(user_groups[i], unique_users[num_groups * group_size + i])
+
+    train_rating_groups = [train_ratings[train_ratings['user'].isin(group)].reset_index(drop=True) for group in
+                        user_groups]
+    test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
+                        user_groups]
+
+elif learn_type == 'receraser':
+    start_time = time.time()
+    #user_embeddings = [[][]]
+    user_embeddings = np.load(f'results/user_emb/{dataset}_wmf_emb.npy', allow_pickle=True).item()
+    unique_users = train_ratings['user'].unique()
+    #item_embeddings = np.load(f'results/item_emb/{dataset}_wmf_emb.npy', allow_pickle=True).item()
+    user_mat = np.array([user_embeddings[user_id][0] for user_id in unique_users])
+
+    _, labels = kmeans(user_mat, num_groups, True, 30)
+
+    user_groups = [[] for _ in range(num_groups)]
+    for user_id, label in zip(unique_users, labels):
+        user_groups[int(label)].append(user_id)
+
+    train_rating_groups = [train_ratings[train_ratings['user'].isin(group)].reset_index(drop=True) for group in
+                            user_groups]
+    test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
+                            user_groups]
+
+    print(f'Grouping time: {time.time() - start_time}')
+'''
