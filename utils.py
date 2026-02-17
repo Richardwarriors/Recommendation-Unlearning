@@ -184,7 +184,8 @@ class NeuMF(nn.Module):
         vec = torch.cat([mlp_vec, mf_vec], dim=-1)
         logits = self.affine(vec)
         #rating = self.logistic(logits)
-        return logits.squeeze()
+        #logits.squeeze()
+        return logits
 
 
 # torch train
@@ -202,8 +203,13 @@ def baseTrain(dataloader, model, loss_fn, opt, device, verbose):
             item = item.to(device)
             rating = rating.to(device)
 
-            pred = model(user, item)
+            #pred = model(user, item)
+            #loss = loss_func(pred, rating)
+
+            pred = model(user, item).view(-1)
+            rating = rating.view(-1)
             loss = loss_func(pred, rating)
+
 
             train_loss += loss.item()
 
@@ -264,7 +270,8 @@ def baseTest(dataloader, model, loss_fn, device, verbose, pos_dict, n_items, top
 
                 new_user = torch.tensor([user_id] * len(candidates), dtype=torch.long).to(device)
                 new_item = torch.tensor(candidates, dtype=torch.long).to(device)
-                predictions = model(new_user, new_item)
+                #oreductuibs
+                predictions = model(new_user, new_item).view(-1)
                 _, indices = torch.topk(predictions, top_k)
                 recommends = torch.take(new_item, indices).cpu().numpy().tolist()
 
@@ -311,8 +318,9 @@ def SISATest_ensemble(dataloader, models, device, pos_dict, n_items, top_k=10):
                 total_logits = None
 
                 for m in models:
-                    logits = m(new_user, new_item)
-
+                    #logits = m(new_user, new_item)
+                    logits = m(new_user, new_item).view(-1)
+                    
                     if total_logits is None:
                         total_logits = logits
                     else:
@@ -341,68 +349,44 @@ def spTrick(model, shrink=0.5, sigma=0.01):
 
 
 #RecEraser Ebsembling model
-def RecEraserTest_ensemble(dataloader, models, device, pos_dict, n_items, top_k=10):
+def RecEraserTest_ensemble(dataloader, models, aggregator, device, pos_dict, n_items, top_k=10):
 
     for m in models:
         m.eval()
-
-    num_shards = len(models)
-    emb_dim = models[0].user_mat_mlp.weight.shape[1] + models[0].user_mat_mf.weight.shape[1]
-
-    aggregator = RecEraserAggregator(emb_dim, num_shards).to(device)
     aggregator.eval()
 
     full_items = list(range(n_items))
-
-    HR = []
-    NDCG = []
+    HR, NDCG = [], []
 
     with torch.no_grad():
-
         for user, item, rating in dataloader:
-
             user = user.to(device)
             item = item.to(device)
 
-            all_users = user.unique()
-
-            for uid in all_users:
-
+            for uid in user.unique():
                 user_id = uid.item()
                 user_indices = torch.where(user == uid)
                 gt_items = item[user_indices].cpu().numpy().tolist()
 
                 neg_pool = list(set(full_items) - set(pos_dict[user_id]))
                 neg_items = random.sample(neg_pool, 99)
-
                 candidates = gt_items + neg_items
 
                 new_user = torch.tensor([user_id] * len(candidates), dtype=torch.long).to(device)
                 new_item = torch.tensor(candidates, dtype=torch.long).to(device)
 
-                # ===== collect shard embeddings =====
-                user_embs = []
-                item_embs = []
-
+                # collect shard embeddings
+                user_embs, item_embs = [], []
                 for m in models:
-
-                    u_mlp = m.user_mat_mlp(new_user)
-                    u_mf = m.user_mat_mf(new_user)
-                    u_emb = torch.cat([u_mlp, u_mf], dim=1)
-
-                    i_mlp = m.item_mat_mlp(new_item)
-                    i_mf = m.item_mat_mf(new_item)
-                    i_emb = torch.cat([i_mlp, i_mf], dim=1)
-
+                    u_emb = torch.cat([m.user_mat_mlp(new_user), m.user_mat_mf(new_user)], dim=1)
+                    i_emb = torch.cat([m.item_mat_mlp(new_item), m.item_mat_mf(new_item)], dim=1)
                     user_embs.append(u_emb.unsqueeze(1))
                     item_embs.append(i_emb.unsqueeze(1))
 
-                user_embs = torch.cat(user_embs, dim=1)
-                item_embs = torch.cat(item_embs, dim=1)
+                user_embs = torch.cat(user_embs, dim=1)  # [C,S,D]
+                item_embs = torch.cat(item_embs, dim=1)  # [C,S,D]
 
-                # ===== attention aggregation =====
                 u_agg, i_agg = aggregator(user_embs, item_embs)
-
                 scores = torch.sum(u_agg * i_agg, dim=1)
 
                 _, indices = torch.topk(scores, top_k)
@@ -411,7 +395,8 @@ def RecEraserTest_ensemble(dataloader, models, device, pos_dict, n_items, top_k=
                 HR.append(hit(gt_items, recommends))
                 NDCG.append(ndcg(gt_items, recommends))
 
-    return np.mean(NDCG), np.mean(HR)
+    return float(np.mean(NDCG)), float(np.mean(HR))
+
 
 ##################### 
 # object saving
@@ -602,13 +587,11 @@ def ot_cluster(X, k, max_iters=10):
 class RecEraserAggregator(nn.Module):
     def __init__(self, emb_dim, num_shards, att_dim=64):
         super().__init__()
-
         self.emb_dim = emb_dim
         self.num_shards = num_shards
-        self.att_dim = att_dim
 
-        # transfer layer W^i
-        self.trans_W = nn.Parameter(torch.randn(num_shards, emb_dim, emb_dim))
+        # shard -> shared space
+        self.trans_W = nn.Parameter(torch.randn(num_shards, emb_dim, emb_dim) * 0.01)
         self.trans_b = nn.Parameter(torch.zeros(num_shards, emb_dim))
 
         # user attention
@@ -619,36 +602,130 @@ class RecEraserAggregator(nn.Module):
         self.WB = nn.Linear(emb_dim, att_dim)
         self.HB = nn.Linear(att_dim, 1)
 
-    def attention(self, embs, flag):
-        # embs shape: [batch, num_shards, emb_dim]
-
-        if flag == 0:
+    def _attn(self, embs, is_user: bool):
+        # embs: [B, S, D]
+        if is_user:
             x = torch.relu(self.WA(embs))
-            score = self.HA(x)
+            score = self.HA(x)  # [B,S,1]
         else:
             x = torch.relu(self.WB(embs))
             score = self.HB(x)
 
-        weight = torch.softmax(score, dim=1)
-        agg_emb = torch.sum(weight * embs, dim=1)
+        w = torch.softmax(score, dim=1)          # [B,S,1]
+        agg = torch.sum(w * embs, dim=1)         # [B,D]
+        return agg, w
 
-        return agg_emb, weight
+    def aggregate_users(self, user_embs):
+        # user_embs: [B,S,D]
+        u_trans = torch.einsum('bsd,sdh->bsh', user_embs, self.trans_W) + self.trans_b
+        u_agg, _ = self._attn(u_trans, is_user=True)
+        return u_agg
+
+    def aggregate_items(self, item_embs):
+        # item_embs: [B,S,D]
+        i_trans = torch.einsum('bsd,sdh->bsh', item_embs, self.trans_W) + self.trans_b
+        i_agg, _ = self._attn(i_trans, is_user=False)
+        return i_agg
 
     def forward(self, user_embs, item_embs):
-        """
-        user_embs: [batch, num_shards, emb_dim]
-        item_embs: [batch, num_shards, emb_dim]
-        """
+        return self.aggregate_users(user_embs), self.aggregate_items(item_embs)
 
-        # transfer each shard to shared space
-        u_trans = torch.einsum('bsd,sdh->bsh', user_embs, self.trans_W) + self.trans_b
-        i_trans = torch.einsum('bsd,sdh->bsh', item_embs, self.trans_W) + self.trans_b
+def train_receraser_aggregator(
+    train_df,               # pandas.DataFrame with columns ['user','item']
+    models,                 # list of shard models (already loaded)
+    aggregator,             # RecEraserAggregator
+    device,
+    pos_dict,               # dict: user -> set(pos_items)  (你已有 npy)
+    n_items: int,
+    epochs_agg: int = 5,
+    batch_size: int = 2048,
+    num_neg: int = 4,
+    lr: float = 1e-3
+):
+    """
+    训练 aggregator，让它学会对不同 shard 的 embeddings 分配权重。
+    shard 模型参数固定（stop-gradient 类似），只更新 aggregator。
+    """
+    aggregator.train()
+    opt = torch.optim.Adam(aggregator.parameters(), lr=lr)
+    bce = nn.BCEWithLogitsLoss()
 
-        u_agg, u_w = self.attention(u_trans, flag=0)
-        i_agg, i_w = self.attention(i_trans, flag=1)
+    users = train_df['user'].to_numpy()
+    items = train_df['item'].to_numpy()
+    N = len(users)
 
-        return u_agg, i_agg
-    
+    for m in models:
+        m.eval()  # shard 冻结
+
+    for ep in range(epochs_agg):
+        idx = np.random.permutation(N)
+
+        total_loss = 0.0
+        steps = 0
+
+        for st in range(0, N, batch_size):
+            ed = min(st + batch_size, N)
+            batch_idx = idx[st:ed]
+            u_pos = users[batch_idx]
+            i_pos = items[batch_idx]
+
+            # ===== negative sampling =====
+            u_all = []
+            i_all = []
+            y_all = []
+
+            for u, ip in zip(u_pos, i_pos):
+                u_all.append(u); i_all.append(ip); y_all.append(1.0)
+
+                neg_pool = list(set(range(n_items)) - set(pos_dict[int(u)]))
+                # 防止某些用户正样本太多导致 neg_pool 太小
+                if len(neg_pool) == 0:
+                    continue
+                negs = random.choices(neg_pool, k=num_neg)
+                for ineg in negs:
+                    u_all.append(u); i_all.append(ineg); y_all.append(0.0)
+
+            u_all = torch.tensor(u_all, dtype=torch.long, device=device)
+            i_all = torch.tensor(i_all, dtype=torch.long, device=device)
+            y_all = torch.tensor(y_all, dtype=torch.float32, device=device)
+
+            # ===== collect shard embeddings (no grad for shard) =====
+            with torch.no_grad():
+                user_embs = []
+                item_embs = []
+                for m in models:
+                    u_mlp = m.user_mat_mlp(u_all)
+                    u_mf  = m.user_mat_mf(u_all)
+                    u_emb = torch.cat([u_mlp, u_mf], dim=1)
+
+                    it_mlp = m.item_mat_mlp(i_all)
+                    it_mf  = m.item_mat_mf(i_all)
+                    it_emb = torch.cat([it_mlp, it_mf], dim=1)
+
+                    user_embs.append(u_emb.unsqueeze(1))
+                    item_embs.append(it_emb.unsqueeze(1))
+
+                user_embs = torch.cat(user_embs, dim=1)  # [B,S,D]
+                item_embs = torch.cat(item_embs, dim=1)  # [B,S,D]
+
+            # ===== aggregator forward (grad) =====
+            u_agg, i_agg = aggregator(user_embs, item_embs)
+            logits = torch.sum(u_agg * i_agg, dim=1)  # dot product score
+
+            loss = bce(logits, y_all)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+            steps += 1
+
+        print(f"[agg epoch {ep+1}/{epochs_agg}] loss={total_loss/max(steps,1):.6f}")
+
+    aggregator.eval()
+    return aggregator
+
 '''
 def kmeans_UBP(X, k, balance=False, max_iters=10):
     # Initialize centroids randomly
