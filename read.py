@@ -98,6 +98,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
     if del_per > 0:
         train_ratings = delete(train_ratings, del_type, del_per, min_inter_per_user=2)
 
+    ensemble_train = [train_ratings['user'], train_ratings['item'], train_ratings['rating']]
     ensemble_test = [test_ratings['user'], test_ratings['item'], test_ratings['rating']]
 
     # active and inactive
@@ -180,7 +181,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
     active_groups = [[ratings['user'], ratings['item'], ratings['rating']] for ratings in active_groups]
     inactive_groups = [[ratings['user'], ratings['item'], ratings['rating']] for ratings in inactive_groups]
 
-    return train_rating_groups, test_rating_groups, active_groups, inactive_groups, ensemble_test
+    return train_rating_groups, test_rating_groups, active_groups, inactive_groups, ensemble_test, ensemble_train
 
 
 class RatingData(Dataset):
