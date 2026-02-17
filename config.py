@@ -1,17 +1,17 @@
 import os
-from turtle import pos
+import pandas as pd
 import warnings
 from os.path import abspath, join, dirname, exists
 
 import numpy as np
 import torch
 from scratch import Scratch
-from utils import RecEraserTest_ensemble, SISATest_ensemble, saveObject
+from utils import RecEraserAggregator, RecEraserTest_ensemble, SISATest_ensemble, saveObject
 
 from read import RatingData, PairData
 from read import loadData, readRating_full, readRating_group
 
-from utils import NeuMF, seed_all, baseTrain, baseTest
+from utils import NeuMF, seed_all, baseTrain, baseTest, train_receraser_aggregator
 from utils import WMF, DMF, NeuMF, BPR
 
 #/home/jiajie/Richard_He/CURE4Rec/data
@@ -106,12 +106,12 @@ class Instance(object):
                                                                                         del_type, del_per)
             return train_rating, test_rating, active_rating, inactive_rating
         else:
-            train_rating, test_rating, active_rating, inactive_rating, ensemble_test = readRating_group(self.param.train_dir,
+            train_rating, test_rating, active_rating, inactive_rating, ensemble_test, ensemble_train = readRating_group(self.param.train_dir,
                                                                                          self.param.test_dir, del_type,
                                                                                          del_per, learn_type, group,
                                                                                          self.param.dataset, model_type)
 
-            return train_rating, test_rating, active_rating, inactive_rating, ensemble_test
+            return train_rating, test_rating, active_rating, inactive_rating, ensemble_test, ensemble_train
 
     def runModel(self, model_type='wmf', verbose=2):
         print(self.name, 'begin:')
@@ -119,7 +119,7 @@ class Instance(object):
         if self.param.learn_type == 'retrain':
             train_rating, test_rating, active_rating, inactive_rating = self.read(model_type)
         else:
-            train_rating, test_rating, active_rating, inactive_rating, ensemble_test = self.read(model_type)
+            train_rating, test_rating, active_rating, inactive_rating, ensemble_test, ensemble_train = self.read(model_type)
 
         if self.param.learn_type == 'retrain':
             # load data
@@ -299,19 +299,22 @@ class Instance(object):
             # ==========================
             # RecEraser ensemble testing: load all shard models and test on the full test set (not split by group)
             # ==========================
-            print("Start ensemble testing...")
+            print("Start RecEraser aggregation...")
 
             models = []
 
             for path in shard_model_paths:
 
                 if model_type == 'neumf':
-                    m = NeuMF(self.param.n_user,
-                            self.param.n_item,
-                            self.param.k,
-                            self.param.layers)
+                    m = NeuMF(
+                        self.param.n_user,
+                        self.param.n_item,
+                        self.param.k,
+                        self.param.layers
+                    )
                 else:
-                    ...
+                    raise NotImplementedError
+
                 state_dict = torch.load(path, map_location=device, weights_only=True)
                 m.load_state_dict(state_dict)
 
@@ -320,53 +323,111 @@ class Instance(object):
 
                 models.append(m)
 
-            #
-            full_test_data = loadData(RatingData(ensemble_test),len(ensemble_test[0]),self.param.n_worker,False)
 
-            pos_dict = np.load(self.param.pos_data,
-                            allow_pickle=True).item()
+            # ========= initialize aggregator =========
+            num_shards = len(models)
+            emb_dim = (
+                models[0].user_mat_mlp.weight.shape[1] +
+                models[0].user_mat_mf.weight.shape[1]
+            )
 
-            ndcg, hr = RecEraserTest_ensemble(full_test_data,models,device,pos_dict,self.param.n_item,top_k=10)
+            aggregator = RecEraserAggregator(
+                emb_dim=emb_dim,
+                num_shards=num_shards,
+                att_dim=64
+            ).to(device)
 
-            print("Final ReEraser HR:", hr)
-            print("Final ReEraser NDCG:", ndcg)
+
+            # ========= train aggregator =========
+            print("Training RecEraser aggregator...")
+
+            train_df = pd.DataFrame({
+                "user": ensemble_train[0],
+                "item": ensemble_train[1]
+            })
+
+            pos_dict = np.load(self.param.pos_data, allow_pickle=True).item()
+
+            aggregator = train_receraser_aggregator(
+                train_df=train_df,
+                models=models,
+                aggregator=aggregator,
+                device=device,
+                pos_dict=pos_dict,
+                n_items=self.param.n_item,
+                epochs_agg=5,
+                batch_size=2048,
+                num_neg=4,
+                lr=1e-3
+            )
+
+
+            # ========= test =========
+            print("Start RecEraser final testing...")
+
+            full_test_data = loadData(
+                RatingData(ensemble_test),
+                len(ensemble_test[0]),
+                self.param.n_worker,
+                False
+            )
+
+            ndcg, hr = RecEraserTest_ensemble(
+                full_test_data,
+                models,
+                aggregator,
+                device,
+                pos_dict,
+                self.param.n_item,
+                top_k=10
+            )
+
+            print("Final RecEraser HR:", hr)
+            print("Final RecEraser NDCG:", ndcg)
+
+        elif self.param.learn_type == 'ultrare':
+            ...
         else:
-            group = self.param.n_group
-            for i in range(group):
-                # load data
-                if model_type in ['wmf', 'dmf', 'neumf']:
-                    train_data = loadData(RatingData(train_rating[i]), self.param.batch,
-                                          self.param.n_worker,
-                                          True)
-                elif model_type in ['bpr', 'lightgcn']:
-                    train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
-                                          self.param.n_worker,
-                                          True)
-
-                test_data = loadData(RatingData(test_rating[i]), len(test_rating[i][0]), self.param.n_worker, False)
-                if len(active_rating[i][0]) > 0:
-                    active_test_data = loadData(RatingData(active_rating[i]), len(active_rating[i][0]),
-                                                self.param.n_worker,
-                                                False)
-                else:
-                    active_test_data = None
-                inactive_test_data = loadData(RatingData(inactive_rating[i]), len(inactive_rating[i][0]),
-                                              self.param.n_worker,
-                                              False)
-
-                model = Scratch(self.param, model_type)
-                model, result = model.train(train_data, test_data, active_test_data, inactive_test_data, verbose,
-                                            given_model='')
-                result.update({'model': model_type, 'dataset': self.param.dataset, 'deltype': self.param.del_type,
-                               'method': self.param.learn_type, 'group': i + 1})
-                
-                save_dir = f'results/{self.param.learn_type}'
-                os.makedirs(save_dir, exist_ok=True)   
-                file_name = f'group{i + 1}_{self.param.n_group}_{model_type}_{self.param.dataset}_{self.param.del_type}_{self.param.del_per}.npy'
-                save_path = os.path.join(save_dir, file_name)
-                np.save(save_path, result)
-                
-                print(f'End of Group {str(i + 1)} / {group} training', self.name)
+            raise NotImplementedError('Learning type not included!')
             
     def run(self, verbose=2):
         self.runModel(self.param.model, verbose)
+
+'''
+    group = self.param.n_group
+    for i in range(group):
+        # load data
+        if model_type in ['wmf', 'dmf', 'neumf']:
+            train_data = loadData(RatingData(train_rating[i]), self.param.batch,
+                                self.param.n_worker,
+                                True)
+        elif model_type in ['bpr', 'lightgcn']:
+            train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
+                                self.param.n_worker,
+                                True)
+
+        test_data = loadData(RatingData(test_rating[i]), len(test_rating[i][0]), self.param.n_worker, False)
+        if len(active_rating[i][0]) > 0:
+            active_test_data = loadData(RatingData(active_rating[i]), len(active_rating[i][0]),
+                                        self.param.n_worker,
+                                        False)
+        else:
+            active_test_data = None
+        inactive_test_data = loadData(RatingData(inactive_rating[i]), len(inactive_rating[i][0]),
+                                    self.param.n_worker,
+                                    False)
+
+        model = Scratch(self.param, model_type)
+        model, result = model.train(train_data, test_data, active_test_data, inactive_test_data, verbose,
+                                    given_model='')
+        result.update({'model': model_type, 'dataset': self.param.dataset, 'deltype': self.param.del_type,
+                    'method': self.param.learn_type, 'group': i + 1})
+        
+        save_dir = f'results/{self.param.learn_type}'
+        os.makedirs(save_dir, exist_ok=True)   
+        file_name = f'group{i + 1}_{self.param.n_group}_{model_type}_{self.param.dataset}_{self.param.del_type}_{self.param.del_per}.npy'
+        save_path = os.path.join(save_dir, file_name)
+        np.save(save_path, result)
+        
+        print(f'End of Group {str(i + 1)} / {group} training', self.name)
+'''
