@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
 
-from utils import kmeans_InBP, ot_cluster
+from utils import kmeans_InBP, kmeans_ot_InBP
 
 def delete(ratings, del_type, del_per, min_inter_per_user=2):
 
@@ -146,24 +146,7 @@ def readRating_group(train_dir, test_dir, del_type='random', del_per=5, learn_ty
         train_rating_groups, test_rating_groups = kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type)
 
     elif learn_type == 'ultrare':
-        start_time = time.time()
-        user_embeddings = np.load(f'results/user_emb/{dataset}_wmf_emb.npy', allow_pickle=True).item()
-        unique_users = train_ratings['user'].unique()
-        user_mat = np.array([user_embeddings[user_id][0] for user_id in unique_users])
-
-        _, labels = ot_cluster(user_mat, num_groups)
-
-
-        user_groups = [[] for _ in range(num_groups)]
-        for user_id, label in zip(unique_users, labels):
-            user_groups[int(label)].append(user_id)
-
-        train_rating_groups = [train_ratings[train_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                               user_groups]
-        test_rating_groups = [test_ratings[test_ratings['user'].isin(group)].reset_index(drop=True) for group in
-                              user_groups]
-
-        print(f'Grouping time: {time.time() - start_time}')
+        train_rating_groups, test_rating_groups = kmeans_ot_InBP(train_ratings,test_ratings,dataset,num_groups,model_type)
 
     active_groups = []
     inactive_groups = []
