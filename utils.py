@@ -412,15 +412,18 @@ def loadObject(filename):
         obj = pickle.load(input)
     return obj
 
-def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_iters=30):
+def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type, max_iters=30):
     """
     Interaction-based Balanced Partition (RecEraser InBP)
     Returns:
-        train_rating_groups
-        test_rating_groups
+        train_rating_groups: list[pd.DataFrame]  (ONLY assigned interactions)
+        test_rating_groups:  list[pd.DataFrame]  (users appearing in this shard's train interactions)
     """
 
     start_time = time.time()
+
+    # ✅ IMPORTANT: reset index so that "idx" aligns with iloc positions
+    train_ratings = train_ratings.reset_index(drop=True)
 
     # ===== load embeddings =====
     user_emb = np.load(
@@ -433,10 +436,9 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
         allow_pickle=True
     ).item()
 
-    # ===== build interaction list =====
-    data = []
-    for _, row in train_ratings.iterrows():
-        data.append((int(row['user']), int(row['item'])))
+    # ===== build interaction list aligned with train_ratings rows =====
+    # data[idx] corresponds to train_ratings.iloc[idx]
+    data = [(int(row['user']), int(row['item'])) for _, row in train_ratings.iterrows()]
 
     n = len(data)
     k = num_groups
@@ -454,11 +456,16 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
     # ===== main loop =====
     for _ in range(max_iters):
 
+        # C is still useful for updating anchors (user->items), but NOT for building train_group
         C = [{} for _ in range(k)]
         C_num = [0] * k
+
+        # ✅ This is the key: store assigned interaction indices for each shard
+        shard_indices = [[] for _ in range(k)]
+
         Scores = {}
 
-        # compute distance
+        # compute distance score for every (interaction idx, shard j)
         for idx, (u, i) in enumerate(data):
 
             pu = user_emb[np.int64(u)][0]
@@ -470,11 +477,10 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
                 dist_u = np.sum((pu - cu) ** 2)
                 dist_i = np.sum((qi - ci) ** 2)
 
+                # larger score = closer (because we sort descending)
                 Scores[(idx, j)] = -(dist_u * dist_i)
 
-        Scores = sorted(Scores.items(),
-                        key=lambda x: x[1],
-                        reverse=True)
+        Scores = sorted(Scores.items(), key=lambda x: x[1], reverse=True)
 
         assigned = set()
 
@@ -482,12 +488,15 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
 
             if idx in assigned:
                 continue
-
             if C_num[shard_id] >= max_data:
                 continue
 
             u, i = data[idx]
 
+            # record interaction index
+            shard_indices[shard_id].append(idx)
+
+            # maintain C for centroid update
             if u not in C[shard_id]:
                 C[shard_id][u] = [i]
             else:
@@ -501,7 +510,6 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
 
         # ===== update anchors =====
         new_centroembs = []
-
         for shard_id in range(k):
 
             temp_u = []
@@ -513,6 +521,7 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
                     temp_i.append(item_emb[np.int64(i)][0])
 
             if len(temp_u) == 0:
+                # empty shard fallback: keep old centroid
                 new_centroembs.append(centroembs[shard_id])
             else:
                 new_centroembs.append((
@@ -520,69 +529,209 @@ def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups,model_type,max_
                     np.mean(temp_i, axis=0)
                 ))
 
-        if all(np.allclose(new_centroembs[i][0], centroembs[i][0]) and
-               np.allclose(new_centroembs[i][1], centroembs[i][1])
-               for i in range(k)):
+        # convergence check
+        if all(
+            np.allclose(new_centroembs[i][0], centroembs[i][0]) and
+            np.allclose(new_centroembs[i][1], centroembs[i][1])
+            for i in range(k)
+        ):
+            centroembs = new_centroembs
             break
 
         centroembs = new_centroembs
 
-    # ===== build shard datasets =====
+    # ===== build shard datasets (✅ FIXED: interaction-based slicing) =====
     train_rating_groups = []
     test_rating_groups = []
 
     for shard_id in range(k):
 
-        shard_users = list(C[shard_id].keys())
+        # ✅ train shard = ONLY assigned interactions
+        shard_idx = shard_indices[shard_id]
+        train_group = train_ratings.iloc[shard_idx].reset_index(drop=True)
 
-        train_group = train_ratings[
-            train_ratings['user'].isin(shard_users)
-        ].reset_index(drop=True)
-
-        test_group = test_ratings[
-            test_ratings['user'].isin(shard_users)
-        ].reset_index(drop=True)
+        # ✅ test shard = users appearing in this shard’s train interactions
+        shard_users = train_group['user'].unique()
+        test_group = test_ratings[test_ratings['user'].isin(shard_users)].reset_index(drop=True)
 
         train_rating_groups.append(train_group)
         test_rating_groups.append(test_group)
 
-    print(f'Grouping time: {time.time() - start_time}')
+    print(f'Grouping time: {time.time() - start_time:.2f}s')
 
     return train_rating_groups, test_rating_groups
 
+def ot_assignment(trans: np.ndarray, k: int, seed: int = 42) -> np.ndarray:
+    """
+    Given OT transport plan trans of shape [n, k],
+    produce a HARD assignment label with STRICT balance:
+      - each shard gets either floor(n/k) or ceil(n/k) samples
+      - assignment prioritizes larger transport mass
+    """
+    rng = np.random.default_rng(seed)
+    n = trans.shape[0]
 
-def ot_cluster(X, k, max_iters=10):
-    # Initialize centroids randomly
-    n, _ = X.shape
-    centroid = X[np.random.choice(n, size=k, replace=False)]
+    # target sizes: first r shards get (q+1), others get q
+    q, r = divmod(n, k)
+    targets = np.array([q + 1 if j < r else q for j in range(k)], dtype=int)
 
-    # Iterate until convergence or maximum iterations
+    label = -np.ones(n, dtype=np.int64)
+    assigned = np.zeros(n, dtype=bool)
+    shard_count = np.zeros(k, dtype=int)
 
-    for _ in range(max_iters):
-        # compute distance
-        dist = ((X - centroid[:, np.newaxis]) ** 2).sum(axis=2)  # [k, n]
+    # To reduce bias, process shards in a random order each time
+    shard_order = np.arange(k)
+    rng.shuffle(shard_order)
 
-        # print(dist.shape)
-        inertia = np.min(dist, axis=0).sum()
+    for j in shard_order:
+        # sort interactions by transport mass to shard j (descending)
+        idx_sorted = np.argsort(-trans[:, j], kind="mergesort")
 
-        # compute sinkhorn distance
-        lam = 1e-3
-        a = np.ones(n) / n
-        b = np.ones(k) / k
-        # b = np.array([0.1, 0.2, 0.3, 0.4])
+        need = targets[j]
+        if need == 0:
+            continue
 
-        trans = ot.emd(a, b, dist.T, lam)
+        cnt = 0
+        for i in idx_sorted:
+            if not assigned[i]:
+                label[i] = j
+                assigned[i] = True
+                shard_count[j] += 1
+                cnt += 1
+                if cnt >= need:
+                    break
 
-        # Update centroids to the mean of assigned samples
-        label = np.argmax(trans, axis=1)
-        new_centroid = np.array([X[label == i].mean(axis=0) for i in range(k)])
+    # If anything unassigned (should be rare), assign remaining to shards with remaining capacity
+    if not assigned.all():
+        remaining_idx = np.where(~assigned)[0]
+        # compute remaining capacities
+        cap = targets - shard_count
+        # fill leftover
+        ptrs = []
+        for j in range(k):
+            if cap[j] > 0:
+                ptrs.extend([j] * cap[j])
+        ptrs = np.array(ptrs, dtype=np.int64)
 
-        # Check if centroids have converged
+        # If still mismatch due to some edge case, just cycle
+        if len(ptrs) < len(remaining_idx):
+            extra = len(remaining_idx) - len(ptrs)
+            ptrs = np.concatenate([ptrs, np.tile(np.arange(k), int(np.ceil(extra / k)))[:extra]])
+
+        for i, j in zip(remaining_idx, ptrs[:len(remaining_idx)]):
+            label[i] = j
+
+    # Sanity check
+    counts = np.bincount(label, minlength=k)
+    assert counts.sum() == n
+    assert counts.max() - counts.min() <= 1, f"Not strictly balanced! counts={counts}"
+
+    return label
+
+
+def kmeans_ot_InBP(train_ratings,test_ratings,dataset,num_groups,model_type,max_iters=20,reg=1e-2,seed=42,verbose=True):
+    """
+    Interaction-level Optimal Balanced Clustering (OBC-ish):
+    - Build interaction embeddings from pretrained user/item embeddings.
+    - Iteratively:
+        (1) compute cost to centroids
+        (2) compute OT transport plan with balanced marginals
+        (3) produce STRICT balanced hard labels from OT transport
+        (4) update centroids by assigned interactions
+    - Build train shards by interaction indices.
+    - Build test shards by users appearing in each train shard.
+    """
+    start_time = time.time()
+    rng = np.random.default_rng(seed)
+
+    # ===== 1) load pretrained embeddings =====
+    user_emb = np.load(f"results/user_emb/{dataset}_{model_type}_user_emb.npy", allow_pickle=True).item()
+    item_emb = np.load(f"results/item_emb/{dataset}_{model_type}_item_emb.npy", allow_pickle=True).item()
+
+    # ===== 2) build interaction embedding matrix X =====
+    users = train_ratings["user"].to_numpy(dtype=np.int64)
+    items = train_ratings["item"].to_numpy(dtype=np.int64)
+    n = len(users)
+    k = int(num_groups)
+
+    # emb dict values shape (1,d) => take [0]
+    d_u = user_emb[np.int64(users[0])][0].shape[0]
+    d_i = item_emb[np.int64(items[0])][0].shape[0]
+
+    X = np.empty((n, d_u + d_i), dtype=np.float32)
+    for idx in range(n):
+        X[idx, :d_u] = user_emb[np.int64(users[idx])][0]
+        X[idx, d_u:] = item_emb[np.int64(items[idx])][0]
+
+    # ===== 3) init centroids =====
+    init_idx = rng.choice(n, size=k, replace=False)
+    centroid = X[init_idx].copy()  # [k, 2d]
+
+    # ===== 4) OT loop =====
+    a = np.ones(n, dtype=np.float64) / n
+    b = np.ones(k, dtype=np.float64) / k
+
+    last_label = None
+    for it in range(max_iters):
+        # cost matrix [n,k] (squared Euclidean)
+        dist = ((X[:, None, :] - centroid[None, :, :]) ** 2).sum(axis=2).astype(np.float64)
+
+        # OT transport plan [n,k]
+        trans = ot.sinkhorn(a, b, dist, reg)
+
+        # STRICT balanced hard assignment (replaces argmax)
+        label = ot_assignment(trans, k=k, seed=seed + it)
+
+        # update centroids
+        new_centroid = centroid.copy()
+        for j in range(k):
+            mask = (label == j)
+            if np.any(mask):
+                new_centroid[j] = X[mask].mean(axis=0)
+
+        if last_label is not None and np.array_equal(label, last_label):
+            centroid = new_centroid
+            break
+
         if np.allclose(centroid, new_centroid):
+            centroid = new_centroid
             break
 
         centroid = new_centroid
-    return inertia, label  # , centroids
+        last_label = label
+
+    # ===== 5) build shard datasets =====
+    train_rating_groups = []
+    test_rating_groups = []
+
+    for shard_id in range(k):
+        shard_idx = np.where(label == shard_id)[0]
+
+        train_group = train_ratings.iloc[shard_idx].reset_index(drop=True)
+
+        shard_users = train_group["user"].unique()
+        test_group = test_ratings[test_ratings["user"].isin(shard_users)].reset_index(drop=True)
+
+        train_rating_groups.append(train_group)
+        test_rating_groups.append(test_group)
+
+    if verbose:
+        counts = np.bincount(label, minlength=k)
+        print("\n[OBC Interaction-level] Strict balanced shard sizes (train interactions):")
+        for j in range(k):
+            print(f"  Shard {j}: {counts[j]}")
+        print(f"  Mean={counts.mean():.2f}, Std={counts.std():.2f}, Max-Min={counts.max()-counts.min()}")
+
+        test_counts = [len(g) for g in test_rating_groups]
+        print("\nTest interactions per shard (after user-filter):")
+        for j, c in enumerate(test_counts):
+            print(f"  Shard {j}: {c}")
+        print(f"  Mean={np.mean(test_counts):.2f}, Std={np.std(test_counts):.2f}, Max-Min={np.max(test_counts)-np.min(test_counts)}")
+
+        print(f"\nUltraRE OBC Grouping time: {time.time() - start_time:.2f}s")
+
+    return train_rating_groups, test_rating_groups
+
 
 class RecEraserAggregator(nn.Module):
     def __init__(self, emb_dim, num_shards, att_dim=64):
@@ -784,4 +933,38 @@ def kmeans_UBP(X, k, balance=False, max_iters=10):
 
     print(f'{inertia:.3f}', end=' ')
     return inertia, label  # , centroid
+
+
+def ot_cluster(X, k, max_iters=10):
+    # Initialize centroids randomly
+    n, _ = X.shape
+    centroid = X[np.random.choice(n, size=k, replace=False)]
+
+    # Iterate until convergence or maximum iterations
+
+    for _ in range(max_iters):
+        # compute distance
+        dist = ((X - centroid[:, np.newaxis]) ** 2).sum(axis=2)  # [k, n]
+
+        # print(dist.shape)
+        inertia = np.min(dist, axis=0).sum()
+
+        # compute sinkhorn distance
+        lam = 1e-3
+        a = np.ones(n) / n
+        b = np.ones(k) / k
+        # b = np.array([0.1, 0.2, 0.3, 0.4])
+
+        trans = ot.emd(a, b, dist.T, lam)
+
+        # Update centroids to the mean of assigned samples
+        label = np.argmax(trans, axis=1)
+        new_centroid = np.array([X[label == i].mean(axis=0) for i in range(k)])
+
+        # Check if centroids have converged
+        if np.allclose(centroid, new_centroid):
+            break
+
+        centroid = new_centroid
+    return inertia, label  # , centroids
 '''
