@@ -4,6 +4,7 @@ import random
 import numpy as np
 import pandas as pd
 import torch
+import os
 from torch import nn, optim
 from torch_sparse import SparseTensor, matmul
 
@@ -308,7 +309,7 @@ def uniform_sample_epoch(num_users, num_items, train_size, user_pos_lists, user_
 # Evaluation: full-ranking
 # -----------------------------
 @torch.no_grad()
-def evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=20, batch_size=256):
+def evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=10, batch_size=256):
     model.eval()
     u_final, _, i_final, _ = model(adj_norm)
 
@@ -353,7 +354,7 @@ def evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=20, bat
 # Evaluation: sampled 1 pos + 99 neg (often used in papers)
 # -----------------------------
 @torch.no_grad()
-def evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=20, neg_num=99, seed=42):
+def evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=10, neg_num=99, seed=42):
     """
     For each user: candidate set = {true_test_item} + 99 negatives (not in train positives, not equal to test item).
     Compute HR/NDCG on this 100-item ranking.
@@ -506,16 +507,16 @@ def train_lightgcn(
 
         if ep == 1 or ep % eval_every == 0:
             if eval_mode == "full":
-                hr, ndcg = evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=20, batch_size=256)
+                hr, ndcg = evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=10, batch_size=256)
             else:
-                hr, ndcg = evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=20, neg_num=99, seed=seed)
+                hr, ndcg = evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=10, neg_num=99, seed=seed)
 
             dt = time.time() - t0
-            print(f"Epoch {ep:04d} | loss={epoch_loss:.4f} | HR@20={hr:.4f} | NDCG@20={ndcg:.4f} | time={dt/60:.1f}m")
+            print(f"Epoch {ep:04d} | loss={epoch_loss:.4f} | HR@10={hr:.4f} | NDCG@10={ndcg:.4f} | time={dt/60:.1f}m")
 
             if ndcg > best_ndcg:
                 best_ndcg, best_hr = ndcg, hr
-                print(f"  >>> New best: NDCG@20={best_ndcg:.4f}, HR@20={best_hr:.4f}")
+                print(f"  >>> New best: NDCG@10={best_ndcg:.4f}, HR@10={best_hr:.4f}")
         
     # ==============================
     # Save final propagated embeddings
@@ -545,7 +546,7 @@ def train_lightgcn(
     return model
 
 @torch.no_grad()
-def SISA_SEnsemble(models,train_edge,test_edge,num_users,num_items,device,neg_num=99,k=20,seed=42):
+def SISA_SEnsemble(models,train_edge,test_edge,num_users,num_items,device,neg_num=99,k=10,seed=42):
 
     rng = np.random.default_rng(seed)
 
@@ -622,7 +623,7 @@ def SISA_SEnsemble(models,train_edge,test_edge,num_users,num_items,device,neg_nu
     return float(np.mean(all_hr)), float(np.mean(all_ndcg))
 
 @torch.no_grad()
-def SISA_FEnsemble(models,train_edge,test_edge,num_users,num_items,device,k=20,batch_size=256):
+def SISA_FEnsemble(models,train_edge,test_edge,num_users,num_items,device,k=10,batch_size=256):
 
     # Build full adjacency
     adj_norm = build_norm_adj(
@@ -750,7 +751,7 @@ def train_receraser_aggregator_lightgcn(
     num_users,
     num_items,
     epochs_agg=5,
-    batch_size=2048,
+    batch_size=1048,
     num_neg=4,
     lr=1e-3,
 ):
@@ -943,7 +944,7 @@ def RecEraser_FEnsemble(
     device,
     num_users,
     num_items,
-    top_k=20,
+    top_k=10,
     batch_size=256,
 ):
 
@@ -1089,8 +1090,10 @@ if __name__ == "__main__":
                 lr=args.lr, decay=args.decay, batch_size=args.batch,
                 eval_every=args.eval_every, neg_k=args.neg_k,
                 eval_mode=args.eval_mode, learn_type=args.learn, seed=42)
-
-            shard_model_path.append(f"./results/group_models/{dataset}_lightgcn_group{i}.pth")
+            
+            save_dir = f'results/{args.learn}'
+            os.makedirs(save_dir, exist_ok=True)   
+            shard_model_path.append(f"{save_dir}/{dataset}_lightgcn_group{i + 1}.pth")
             torch.save(model.state_dict(), shard_model_path[-1])
             print(f"Group {i+1} model saved to {shard_model_path[-1]}")
 
@@ -1105,19 +1108,20 @@ if __name__ == "__main__":
         for path in shard_model_path:
             m = LightGCN(num_users,num_items,embedding_dim=args.embed,K=args.layers)
 
-            state_dict = torch.load(path, map_location=device)
+            state_dict = torch.load(path, map_location=device, weights_only=True)
             m.load_state_dict(state_dict)
             m.to(device)
             m.eval()
             models.append(m)
         
         if args.eval_mode == "full":
-            hr, ndcg = SISA_FEnsemble(models,ensemble_train_edge,ensemble_test_edge,num_users,num_items,device,k=20)
+            hr, ndcg = SISA_FEnsemble(models,ensemble_train_edge,ensemble_test_edge,num_users,num_items,device,k=10)
         else:
-            hr, ndcg = SISA_SEnsemble(models, ensemble_train_edge, ensemble_test_edge, num_users,num_items,device,neg_num=99,k=20)
+            hr, ndcg = SISA_SEnsemble(models, ensemble_train_edge, ensemble_test_edge, num_users,num_items,device,neg_num=99,k=10)
 
-        print("SISA HR@20:", hr)
-        print("SISA NDCG@20:", ndcg)
+        print("SISA HR@10:", hr)
+        print("SISA NDCG@10:", ndcg)
+
     elif args.learn == 'receraser':
         group = args.group
         shard_model_path = []
@@ -1132,8 +1136,10 @@ if __name__ == "__main__":
                 lr=args.lr, decay=args.decay, batch_size=args.batch,
                 eval_every=args.eval_every, neg_k=args.neg_k,
                 eval_mode=args.eval_mode, learn_type=args.learn, seed=42)
-
-            shard_model_path.append(f"./results/group_models/{dataset}_lightgcn_group{i}.pth")
+            
+            save_dir = f'results/{args.learn}'
+            os.makedirs(save_dir, exist_ok=True)   
+            shard_model_path.append(f"{save_dir}/{dataset}_lightgcn_group{i + 1}.pth")
             torch.save(model.state_dict(), shard_model_path[-1])
             print(f"Group {i+1} model saved to {shard_model_path[-1]}")
         
@@ -1142,7 +1148,7 @@ if __name__ == "__main__":
 
         for path in shard_model_path:
             m = LightGCN(num_users, num_items, args.embed, args.layers)
-            state_dict = torch.load(path, map_location=device)
+            state_dict = torch.load(path, map_location=device, weights_only=True)
             m.load_state_dict(state_dict)
             m.to(device)
             m.eval()
@@ -1167,14 +1173,74 @@ if __name__ == "__main__":
         if args.eval_mode == "full":
             ndcg, hr = RecEraser_FEnsemble(models=models,aggregator=aggregator,
                 train_edge=ensemble_train_edge,test_edge=ensemble_test_edge,
-                device=device,num_users=num_users,num_items=num_items,top_k=20)
+                device=device,num_users=num_users,num_items=num_items,top_k=10)
         else:
             ndcg, hr = RecEraser_SEnsemble(models=models,aggregator=aggregator,train_edge=ensemble_train_edge,test_edge=ensemble_test_edge,
-            device=device,pos_dict=pos_dict,num_users=num_users,num_items=num_items,top_k=20)
+            device=device,pos_dict=pos_dict,num_users=num_users,num_items=num_items,top_k=10)
 
         print("\n====== RecEraser Final Result ======")
-        print("HR@20:", hr)
-        print("NDCG@20:", ndcg)
+        print("HR@10:", hr)
+        print("NDCG@10:", ndcg)
+    
+    elif args.learn == 'ultrare':
+        group = args.group
+        shard_model_path = []
+
+        train_edge_groups, test_edge_groups, ensemble_train_edge,ensemble_test_edge = readRating_group_lightgcn(train_path, test_path,user_mapping, item_mapping, del_type=args.deltype, 
+                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='lightgcn')
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        for i in range(group):
+            print(f"\n=== Training group {i+1}/{group} ===")
+            model = train_lightgcn(train_edge=train_edge_groups[i], test_edge=test_edge_groups[i], num_users=num_users,num_items=num_items, device=device, epochs=args.epoch, embed_dim=args.embed,K_layers=args.layers,
+                lr=args.lr, decay=args.decay, batch_size=args.batch,
+                eval_every=args.eval_every, neg_k=args.neg_k,
+                eval_mode=args.eval_mode, learn_type=args.learn, seed=42)
+            
+            save_dir = f'results/{args.learn}'
+            os.makedirs(save_dir, exist_ok=True)   
+            shard_model_path.append(f"{save_dir}/{dataset}_lightgcn_group{i + 1}.pth")
+            torch.save(model.state_dict(), shard_model_path[-1])
+            print(f"Group {i+1} model saved to {shard_model_path[-1]}")
+        
+            # ===== load shard models =====
+        models = []
+
+        for path in shard_model_path:
+            m = LightGCN(num_users, num_items, args.embed, args.layers)
+            state_dict = torch.load(path, map_location=device, weights_only=True)
+            m.load_state_dict(state_dict)
+            m.to(device)
+            m.eval()
+            models.append(m)
+
+        # ===== build pos_dict =====
+        pos_dict = build_user_pos_sets(ensemble_train_edge, num_users)
+
+        # ===== initialize aggregator =====
+        aggregator = RecEraserAggregator(
+            emb_dim=args.embed,
+            num_shards=len(models),
+            att_dim=64
+        ).to(device)
+
+        # ===== train aggregator =====
+        aggregator = train_receraser_aggregator_lightgcn(train_edge=ensemble_train_edge,models=models,aggregator=aggregator,device=device,
+            pos_dict=pos_dict,num_users=num_users,num_items=num_items,epochs_agg=5,batch_size=2048,
+            num_neg=4,lr=1e-3)
+
+        # ===== final test =====
+        if args.eval_mode == "full":
+            ndcg, hr = RecEraser_FEnsemble(models=models,aggregator=aggregator,
+                train_edge=ensemble_train_edge,test_edge=ensemble_test_edge,
+                device=device,num_users=num_users,num_items=num_items,top_k=10)
+        else:
+            ndcg, hr = RecEraser_SEnsemble(models=models,aggregator=aggregator,train_edge=ensemble_train_edge,test_edge=ensemble_test_edge,
+            device=device,pos_dict=pos_dict,num_users=num_users,num_items=num_items,top_k=10)
+
+        print("\n====== UltraRE Final Result ======")
+        print("HR@10:", hr)
+        print("NDCG@10:", ndcg)
 
 
 
