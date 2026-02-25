@@ -8,7 +8,7 @@ import os
 from torch import nn, optim
 from torch_sparse import SparseTensor, matmul
 
-from utils import kmeans_InBP, kmeans_ot_InBP
+import ot  # POT
 
 # -----------------------------
 # Utils: mapping / loading
@@ -76,6 +76,308 @@ def readRating_full_lightgcn(train_dir, test_dir, user_mapping, item_mapping, de
     test_edge = load_edge(test_ratings, user_mapping, item_mapping)
     return train_edge, test_edge
 
+# =========================================================
+# (RecEraser) Balanced K-means InBP (your version)
+# =========================================================
+def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type, max_iters=30):
+    """
+    Interaction-based Balanced Partition (RecEraser InBP)
+    Returns:
+        train_rating_groups: list[pd.DataFrame]  (ONLY assigned interactions)
+        test_rating_groups:  list[pd.DataFrame]  (users appearing in this shard's train interactions)
+    """
+    start_time = time.time()
+    train_ratings = train_ratings.reset_index(drop=True)
+
+    user_emb = np.load(f"results/user_emb/{dataset}_{model_type}_user_emb.npy", allow_pickle=True).item()
+    item_emb = np.load(f"results/item_emb/{dataset}_{model_type}_item_emb.npy", allow_pickle=True).item()
+
+    data = [(int(row["user"]), int(row["item"])) for _, row in train_ratings.iterrows()]
+    n = len(data)
+    k = int(num_groups)
+    max_data = int(np.ceil(1.2 * n / k))
+
+    centroids = random.sample(data, k)
+    centroembs = []
+    for u, i in centroids:
+        pu = user_emb[np.int64(u)][0]
+        qi = item_emb[np.int64(i)][0]
+        centroembs.append((pu, qi))
+
+    # keep shard_indices from last iter
+    shard_indices = [[] for _ in range(k)]
+
+    for _ in range(max_iters):
+        C = [{} for _ in range(k)]
+        C_num = [0] * k
+        shard_indices = [[] for _ in range(k)]
+        Scores = {}
+
+        for idx, (u, i) in enumerate(data):
+            pu = user_emb[np.int64(u)][0]
+            qi = item_emb[np.int64(i)][0]
+
+            for j in range(k):
+                cu, ci = centroembs[j]
+                dist_u = np.sum((pu - cu) ** 2)
+                dist_i = np.sum((qi - ci) ** 2)
+                Scores[(idx, j)] = -(dist_u * dist_i)
+
+        Scores = sorted(Scores.items(), key=lambda x: x[1], reverse=True)
+        assigned = set()
+
+        for (idx, shard_id), _ in Scores:
+            if idx in assigned:
+                continue
+            if C_num[shard_id] >= max_data:
+                continue
+
+            u, i = data[idx]
+            shard_indices[shard_id].append(idx)
+
+            if u not in C[shard_id]:
+                C[shard_id][u] = [i]
+            else:
+                C[shard_id][u].append(i)
+
+            C_num[shard_id] += 1
+            assigned.add(idx)
+
+            if len(assigned) == n:
+                break
+
+        new_centroembs = []
+        for shard_id in range(k):
+            temp_u, temp_i = [], []
+            for u in C[shard_id]:
+                for i in C[shard_id][u]:
+                    temp_u.append(user_emb[np.int64(u)][0])
+                    temp_i.append(item_emb[np.int64(i)][0])
+
+            if len(temp_u) == 0:
+                new_centroembs.append(centroembs[shard_id])
+            else:
+                new_centroembs.append((np.mean(temp_u, axis=0), np.mean(temp_i, axis=0)))
+
+        if all(
+            np.allclose(new_centroembs[i][0], centroembs[i][0]) and np.allclose(new_centroembs[i][1], centroembs[i][1])
+            for i in range(k)
+        ):
+            centroembs = new_centroembs
+            break
+
+        centroembs = new_centroembs
+
+    train_rating_groups, test_rating_groups = [], []
+    for shard_id in range(k):
+        shard_idx = shard_indices[shard_id]
+        train_group = train_ratings.iloc[shard_idx].reset_index(drop=True)
+        shard_users = train_group["user"].unique()
+        test_group = test_ratings[test_ratings["user"].isin(shard_users)].reset_index(drop=True)
+        train_rating_groups.append(train_group)
+        test_rating_groups.append(test_group)
+
+    print(f"Grouping time: {time.time() - start_time:.2f}s")
+    return train_rating_groups, test_rating_groups
+
+
+def ot_assignment(trans: np.ndarray, k: int, seed: int = 42) -> np.ndarray:
+    """
+    STRICT balanced hard assignment from OT plan.
+    trans: [n, k]
+    Output label: [n] with counts differing by at most 1.
+    """
+    rng = np.random.default_rng(seed)
+    n = trans.shape[0]
+
+    q, r = divmod(n, k)
+    targets = np.array([q + 1 if j < r else q for j in range(k)], dtype=int)
+
+    label = -np.ones(n, dtype=np.int64)
+    assigned = np.zeros(n, dtype=bool)
+    shard_count = np.zeros(k, dtype=int)
+
+    shard_order = np.arange(k)
+    rng.shuffle(shard_order)
+
+    # Greedy fill each shard by highest mass to that shard
+    for j in shard_order:
+        need = targets[j]
+        if need <= 0:
+            continue
+
+        idx_sorted = np.argsort(-trans[:, j], kind="mergesort")
+
+        cnt = 0
+        for i in idx_sorted:
+            if not assigned[i]:
+                label[i] = j
+                assigned[i] = True
+                shard_count[j] += 1
+                cnt += 1
+                if cnt >= need:
+                    break
+
+    # Fill any leftover (rare)
+    if not assigned.all():
+        remaining_idx = np.where(~assigned)[0]
+        cap = targets - shard_count
+
+        ptrs = []
+        for j in range(k):
+            if cap[j] > 0:
+                ptrs.extend([j] * cap[j])
+        ptrs = np.array(ptrs, dtype=np.int64)
+
+        if len(ptrs) < len(remaining_idx):
+            extra = len(remaining_idx) - len(ptrs)
+            ptrs = np.concatenate([ptrs, np.tile(np.arange(k), int(np.ceil(extra / k)))[:extra]])
+
+        for i, j in zip(remaining_idx, ptrs[:len(remaining_idx)]):
+            label[i] = j
+
+    counts = np.bincount(label, minlength=k)
+    assert counts.sum() == n
+    assert counts.max() - counts.min() <= 1, f"Not strictly balanced! counts={counts}"
+    return label
+
+
+def kmeans_ot_InBP(
+    train_ratings,
+    test_ratings,
+    dataset,
+    num_groups,
+    model_type,
+    max_iters=20,
+    reg=5e-3, #unlearn 0 和 5 5e-2; 10 1e-1 or 2e-1
+    seed=42,
+    verbose=True,
+):
+    """
+    ✅ TRUE interaction-level UltraRE(OBC):
+      - sample = interaction (u,i)
+      - cost = ||p_u - c_u||^2 * ||q_i - c_i||^2  (multiplicative, NOT concat L2)
+      - OT(Sinkhorn) => soft plan
+      - STRICT balanced hard assignment via ot_assignment
+      - train shard built by interaction indices (NOT user isin)
+    """
+    t0 = time.time()
+    rng = np.random.default_rng(seed)
+
+    # -------- 1) load pretrained embeddings (dict: id -> (1,d) array) --------
+    user_emb = np.load(f"results/user_emb/{dataset}_neumf_user_emb.npy", allow_pickle=True).item()
+    item_emb = np.load(f"results/item_emb/{dataset}_neumf_item_emb.npy", allow_pickle=True).item()
+
+    # -------- 2) build interaction arrays aligned with train_ratings row order --------
+    users = train_ratings["user"].to_numpy(dtype=np.int64)
+    items = train_ratings["item"].to_numpy(dtype=np.int64)
+    n = len(users)
+    k = int(num_groups)
+
+    # Pull dimensions
+    du = user_emb[np.int64(users[0])][0].shape[0]
+    di = item_emb[np.int64(items[0])][0].shape[0]
+
+    # Vectorize: build Pu [n,du], Qi [n,di]
+    # (loop over n is still O(n) but avoids O(n*k) nested loops; the heavy part is OT and cost matrix anyway)
+    Pu = np.empty((n, du), dtype=np.float32)
+    Qi = np.empty((n, di), dtype=np.float32)
+    for idx in range(n):
+        Pu[idx] = user_emb[np.int64(users[idx])][0]
+        Qi[idx] = item_emb[np.int64(items[idx])][0]
+
+    # Optional but strongly recommended: L2 normalize for stable OT scale
+    Pu = Pu / (np.linalg.norm(Pu, axis=1, keepdims=True) + 1e-12)
+    Qi = Qi / (np.linalg.norm(Qi, axis=1, keepdims=True) + 1e-12)
+
+    # -------- 3) init interaction anchors: pick k interactions -> centroid_u, centroid_i --------
+    init_idx = rng.choice(n, size=k, replace=False)
+    Cu = Pu[init_idx].copy()  # [k,du]
+    Ci = Qi[init_idx].copy()  # [k,di]
+
+    # OT marginals (balanced shards)
+    a = np.ones(n, dtype=np.float64) / n
+    b = np.ones(k, dtype=np.float64) / k
+
+    last_label = None
+
+    # -------- 4) OBC loop --------
+    for it in range(max_iters):
+        # dist_u: [n,k] = ||Pu - Cu||^2
+        # dist_i: [n,k] = ||Qi - Ci||^2
+        # cost:   [n,k] = dist_u * dist_i  (multiplicative interaction distance)
+        dist_u = ((Pu[:, None, :] - Cu[None, :, :]) ** 2).sum(axis=2).astype(np.float64)
+        dist_i = ((Qi[:, None, :] - Ci[None, :, :]) ** 2).sum(axis=2).astype(np.float64)
+        cost = dist_u * dist_i
+
+        # Normalize cost for numerical stability (important!)
+        cost = cost / (cost.max() + 1e-12)
+
+        # Sinkhorn stabilized (avoid overflow/div0 you saw)
+        # If this still warns, try reg=1e-1 or 2e-1
+        trans = ot.bregman.sinkhorn_stabilized(
+            a, b, cost, reg,
+            numItermax=2000,
+            stopThr=1e-9,
+            verbose=False
+        )  # [n,k]
+
+        # STRICT balanced hard assignment
+        label = ot_assignment(trans, k=k, seed=seed + it)
+        #label = np.argmax(trans, axis=1)
+
+        # Update centroids (mean of assigned interactions)
+        new_Cu = Cu.copy()
+        new_Ci = Ci.copy()
+        for j in range(k):
+            mask = (label == j)
+            if np.any(mask):
+                new_Cu[j] = Pu[mask].mean(axis=0)
+                new_Ci[j] = Qi[mask].mean(axis=0)
+            #else:
+            #    print(f"Warning: shard {j} is empty at iteration {it}! Reinitializing centroid randomly.")
+            #    # avoid empty cluster
+            #    rand_id = rng.integers(0, n)
+            #    new_Cu[j] = Pu[rand_id]
+            #    new_Ci[j] = Qi[rand_id]
+
+        # Convergence
+        if last_label is not None and np.array_equal(label, last_label):
+            Cu, Ci = new_Cu, new_Ci
+            break
+        if np.allclose(Cu, new_Cu) and np.allclose(Ci, new_Ci):
+            Cu, Ci = new_Cu, new_Ci
+            break
+
+        Cu, Ci = new_Cu, new_Ci
+        last_label = label
+
+    # -------- 5) build shard datasets (CRITICAL: by interaction indices) --------
+    train_rating_groups = []
+    test_rating_groups = []
+
+    for shard_id in range(k):
+        shard_idx = np.where(label == shard_id)[0]
+
+        #train shard = ONLY assigned interactions
+        train_group = train_ratings.iloc[shard_idx].reset_index(drop=True)
+
+        #test shard = users appearing in this shard's train interactions (common practice)
+        shard_users = train_group["user"].unique()
+        test_group = test_ratings[test_ratings["user"].isin(shard_users)].reset_index(drop=True)
+
+        train_rating_groups.append(train_group)
+        test_rating_groups.append(test_group)
+
+    if verbose:
+        counts = np.bincount(label, minlength=k)
+        print("\n[UltraRE Interaction-level OBC] STRICT balanced shard sizes (train interactions):")
+        for j in range(k):
+            print(f"  Shard {j}: {counts[j]}")
+        print(f"  Mean={counts.mean():.2f}, Std={counts.std():.2f}, Max-Min={counts.max()-counts.min()}")
+        print(f"UltraRE OBC Grouping time: {time.time() - t0:.2f}s")
+
+    return train_rating_groups, test_rating_groups
 
 def readRating_group_lightgcn(train_dir, test_dir,
                               user_mapping, item_mapping,
@@ -84,7 +386,7 @@ def readRating_group_lightgcn(train_dir, test_dir,
                               learn_type='sisa',
                               num_groups=10,
                               dataset='ml-1m',
-                              model_type='lightgcn'):
+                              model_type='neumf'):
 
     train_ratings = pd.read_csv(train_dir)
     train_ratings['rating'] = 1
@@ -538,7 +840,7 @@ def train_lightgcn(
             item_dict[np.int64(iid)] = i_np[iid:iid+1]
 
         np.save(f"./results/user_emb/{dataset}_lightgcn_user_emb.npy", user_dict)
-        np.save(f"./results/user_emb/{dataset}_lightgcn_item_emb.npy", item_dict)
+        np.save(f"./results/item_emb/{dataset}_lightgcn_item_emb.npy", item_dict)
 
         print("Final user embeddings saved to user_embedding.npy")
         print("Final item embeddings saved to item_embedding.npy")
@@ -1031,6 +1333,19 @@ def RecEraser_FEnsemble(
 
     return float(np.mean(NDCG)), float(np.mean(HR))
 
+# -------------------------------------------------
+# LR Combiner (β ≥ 0, sum β = 1)
+# -------------------------------------------------
+class LRCombiner(nn.Module):
+    def __init__(self, num_shards):
+        super().__init__()
+        self.raw_beta = nn.Parameter(torch.zeros(num_shards))
+
+    def forward(self, shard_scores):
+        # shard_scores: [B, k]
+        beta = torch.softmax(self.raw_beta, dim=0)  # enforce constraint
+        return torch.sum(beta * shard_scores, dim=1)
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -1041,7 +1356,7 @@ if __name__ == "__main__":
     parser.add_argument('--learn', type=str, default='retrain', help='type of learning and unlearning')
     parser.add_argument("--group", type=int, default=10, help="number of groups for group-based unlearning (only for sisa/receraser/ultrare)")
     parser.add_argument("--delper", type=int, default=0, help="deletion percentage for retrain (0 means no deletion, 100 means all interactions deleted)")
-    parser.add_argument("--epoch", type=int, default=500)
+    parser.add_argument("--epoch", type=int, default=100)
     parser.add_argument("--embed", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -1081,7 +1396,7 @@ if __name__ == "__main__":
         shard_model_path = []
 
         train_edge_groups, test_edge_groups, ensemble_train_edge,ensemble_test_edge = readRating_group_lightgcn(train_path, test_path,user_mapping, item_mapping, del_type=args.deltype, 
-                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='lightgcn')
+                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='neumf')
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         for i in range(group):
@@ -1127,7 +1442,7 @@ if __name__ == "__main__":
         shard_model_path = []
 
         train_edge_groups, test_edge_groups, ensemble_train_edge,ensemble_test_edge = readRating_group_lightgcn(train_path, test_path,user_mapping, item_mapping, del_type=args.deltype, 
-                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='lightgcn')
+                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='neumf')
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         for i in range(group):
@@ -1183,27 +1498,59 @@ if __name__ == "__main__":
         print("NDCG@10:", ndcg)
     
     elif args.learn == 'ultrare':
+
         group = args.group
         shard_model_path = []
 
-        train_edge_groups, test_edge_groups, ensemble_train_edge,ensemble_test_edge = readRating_group_lightgcn(train_path, test_path,user_mapping, item_mapping, del_type=args.deltype, 
-                                                                                                                del_per=args.delper, learn_type=args.learn, num_groups=group, dataset=dataset, model_type='lightgcn')
+        train_edge_groups, test_edge_groups, ensemble_train_edge, ensemble_test_edge = \
+            readRating_group_lightgcn(
+                train_path,
+                test_path,
+                user_mapping,
+                item_mapping,
+                del_type=args.deltype,
+                del_per=args.delper,
+                learn_type=args.learn,
+                num_groups=group,
+                dataset=dataset,
+                model_type='neumf'
+            )
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # ===== Train shard models =====
         for i in range(group):
             print(f"\n=== Training group {i+1}/{group} ===")
-            model = train_lightgcn(train_edge=train_edge_groups[i], test_edge=test_edge_groups[i], num_users=num_users,num_items=num_items, device=device, epochs=args.epoch, embed_dim=args.embed,K_layers=args.layers,
-                lr=args.lr, decay=args.decay, batch_size=args.batch,
-                eval_every=args.eval_every, neg_k=args.neg_k,
-                eval_mode=args.eval_mode, learn_type=args.learn, seed=42)
-            
+
+            model = train_lightgcn(
+                train_edge=train_edge_groups[i],
+                test_edge=test_edge_groups[i],
+                num_users=num_users,
+                num_items=num_items,
+                device=device,
+                epochs=args.epoch,
+                embed_dim=args.embed,
+                K_layers=args.layers,
+                lr=args.lr,
+                decay=args.decay,
+                batch_size=args.batch,
+                eval_every=args.eval_every,
+                neg_k=args.neg_k,
+                eval_mode=args.eval_mode,
+                learn_type=args.learn,
+                seed=42
+            )
+
             save_dir = f'results/{args.learn}'
-            os.makedirs(save_dir, exist_ok=True)   
-            shard_model_path.append(f"{save_dir}/{dataset}_lightgcn_group{i + 1}.pth")
-            torch.save(model.state_dict(), shard_model_path[-1])
-            print(f"Group {i+1} model saved to {shard_model_path[-1]}")
-        
-            # ===== load shard models =====
+            os.makedirs(save_dir, exist_ok=True)
+
+            path = f"{save_dir}/{dataset}_lightgcn_group{i + 1}.pth"
+            torch.save(model.state_dict(), path)
+            shard_model_path.append(path)
+
+            print(f"Group {i+1} model saved to {path}")
+
+        # ===== Load shard models =====
         models = []
 
         for path in shard_model_path:
@@ -1214,7 +1561,7 @@ if __name__ == "__main__":
             m.eval()
             models.append(m)
 
-        # ===== build pos_dict =====
+        # ===== Train Combiner (UltraRE Stage III) =====
         pos_dict = build_user_pos_sets(ensemble_train_edge, num_users)
 
         # ===== initialize aggregator =====
@@ -1224,7 +1571,6 @@ if __name__ == "__main__":
             att_dim=64
         ).to(device)
 
-        # ===== train aggregator =====
         aggregator = train_receraser_aggregator_lightgcn(train_edge=ensemble_train_edge,models=models,aggregator=aggregator,device=device,
             pos_dict=pos_dict,num_users=num_users,num_items=num_items,epochs_agg=5,batch_size=2048,
             num_neg=4,lr=1e-3)
@@ -1246,4 +1592,219 @@ if __name__ == "__main__":
 
 
 
-        
+
+'''
+def train_lr_combiner(
+    models,
+    train_edge,
+    num_users,
+    num_items,
+    device,
+    epochs=3,
+    batch_size=2048,
+    num_neg=4,
+    lr=1e-2,
+):
+    lr_model = LRCombiner(len(models)).to(device)
+    optimizer = torch.optim.Adam(lr_model.parameters(), lr=lr)
+    bce = nn.BCEWithLogitsLoss()
+
+    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
+
+    shard_user_embs = []
+    shard_item_embs = []
+
+    for m in models:
+        m.eval()
+        with torch.no_grad():
+            u_final, _, i_final, _ = m(adj_norm)
+        shard_user_embs.append(u_final)
+        shard_item_embs.append(i_final)
+
+    pos_dict = build_user_pos_sets(train_edge, num_users)
+
+    users = train_edge[0].cpu().numpy()
+    items = train_edge[1].cpu().numpy()
+    N = len(users)
+
+    for ep in range(epochs):
+        perm = np.random.permutation(N)
+        total_loss = 0
+
+        for st in range(0, N, batch_size):
+            ed = min(st + batch_size, N)
+            idx = perm[st:ed]
+
+            u_batch = users[idx]
+            i_pos = items[idx]
+
+            u_all, i_all, y_all = [], [], []
+
+            for u, ip in zip(u_batch, i_pos):
+                u_all.append(u)
+                i_all.append(ip)
+                y_all.append(1)
+
+                neg_pool = list(set(range(num_items)) - set(pos_dict[int(u)]))
+                negs = random.sample(neg_pool, num_neg)
+                for ineg in negs:
+                    u_all.append(u)
+                    i_all.append(ineg)
+                    y_all.append(0)
+
+            u_all = torch.tensor(u_all, device=device)
+            i_all = torch.tensor(i_all, device=device)
+            y_all = torch.tensor(y_all, dtype=torch.float32, device=device)
+
+            shard_scores = []
+            for g in range(len(models)):
+                u_emb = shard_user_embs[g][u_all]
+                i_emb = shard_item_embs[g][i_all]
+                score = torch.sum(u_emb * i_emb, dim=1)
+                shard_scores.append(score.unsqueeze(1))
+
+            X = torch.cat(shard_scores, dim=1)
+
+            logits = lr_model(X)
+            loss = bce(logits, y_all)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"[UltraRE LR Epoch {ep+1}] loss={total_loss:.6f}")
+
+    return lr_model
+
+@torch.no_grad()
+def UltraRE_FEnsemble(
+    models,
+    lr_model,
+    train_edge,
+    test_edge,
+    num_users,
+    num_items,
+    device,
+    top_k=10,
+):
+    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
+
+    shard_user_embs, shard_item_embs = [], []
+    for m in models:
+        m.eval()
+        u_final, _, i_final, _ = m(adj_norm)
+        shard_user_embs.append(u_final)
+        shard_item_embs.append(i_final)
+
+    # build test dict
+    test_dict = {}
+    for u, it in zip(test_edge[0].cpu().numpy(), test_edge[1].cpu().numpy()):
+        test_dict.setdefault(int(u), set()).add(int(it))
+
+    # build train dict
+    train_dict = {}
+    for u, it in zip(train_edge[0].cpu().numpy(), train_edge[1].cpu().numpy()):
+        train_dict.setdefault(int(u), set()).add(int(it))
+
+    HR, NDCG = [], []
+
+    for u in test_dict.keys():
+
+        shard_scores_list = []
+
+        for g in range(len(models)):
+            user_emb = shard_user_embs[g][u]                    # [d]
+            score_g = torch.matmul(shard_item_embs[g], user_emb)  # [num_items]
+            shard_scores_list.append(score_g.unsqueeze(1))
+
+        shard_scores = torch.cat(shard_scores_list, dim=1)  # [num_items, k]
+
+        final_scores = lr_model(shard_scores)  # [num_items]
+
+        # remove training positives
+        if u in train_dict:
+            final_scores[list(train_dict[u])] = -1e10
+
+        _, topk = torch.topk(final_scores, top_k)
+        topk = topk.cpu().numpy()
+
+        targets = test_dict[u]
+        hits = [1 if int(i) in targets else 0 for i in topk]
+
+        HR.append(1.0 if sum(hits) > 0 else 0.0)
+
+        dcg = sum(h / np.log2(idx + 2) for idx, h in enumerate(hits))
+        idcg = sum(1.0 / np.log2(idx + 2)
+                   for idx in range(min(len(targets), top_k)))
+
+        NDCG.append(dcg / idcg if idcg > 0 else 0.0)
+
+    return float(np.mean(NDCG)), float(np.mean(HR))
+
+@torch.no_grad()
+def UltraRE_SEnsemble(
+    models,
+    lr_model,
+    train_edge,
+    test_edge,
+    num_users,
+    num_items,
+    device,
+    pos_dict,
+    top_k=10,
+    num_neg=99,
+):
+    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
+
+    shard_user_embs, shard_item_embs = [], []
+    for m in models:
+        m.eval()
+        u_final, _, i_final, _ = m(adj_norm)
+        shard_user_embs.append(u_final)
+        shard_item_embs.append(i_final)
+
+    test_users = test_edge[0].cpu().numpy()
+    test_items = test_edge[1].cpu().numpy()
+
+    HR, NDCG = [], []
+
+    for u, pos_item in zip(test_users, test_items):
+
+        # sample negatives
+        neg_pool = list(set(range(num_items)) - set(pos_dict[int(u)]))
+        neg_items = random.sample(neg_pool, num_neg)
+
+        eval_items = neg_items + [int(pos_item)]
+        eval_items = torch.tensor(eval_items, device=device)
+
+        shard_scores_list = []
+
+        for g in range(len(models)):
+            user_emb = shard_user_embs[g][u]                    # [d]
+            item_emb = shard_item_embs[g][eval_items]           # [100, d]
+            score_g = torch.sum(user_emb * item_emb, dim=1)     # [100]
+            shard_scores_list.append(score_g.unsqueeze(1))
+
+        shard_scores = torch.cat(shard_scores_list, dim=1)  # [100, k]
+
+        final_scores = lr_model(shard_scores)  # [100]
+
+        _, topk = torch.topk(final_scores, top_k)
+        topk = topk.cpu().numpy()
+
+        # ground truth index is always last one
+        gt_index = len(eval_items) - 1
+
+        hits = [1 if i == gt_index else 0 for i in topk]
+
+        HR.append(1.0 if sum(hits) > 0 else 0.0)
+
+        dcg = sum(h / np.log2(idx + 2) for idx, h in enumerate(hits))
+        idcg = 1.0  # only one positive
+
+        NDCG.append(dcg / idcg)
+
+    return float(np.mean(NDCG)), float(np.mean(HR))
+'''
