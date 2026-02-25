@@ -249,7 +249,7 @@ def kmeans_ot_InBP(
     num_groups,
     model_type,
     max_iters=20,
-    reg=5e-3, #unlearn 0 和 5 5e-2; 10 1e-1 or 2e-1
+    reg=5e-2, #unlearn 0 和 5 5e-2; 10 1e-1 or 2e-1
     seed=42,
     verbose=True,
 ):
