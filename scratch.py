@@ -1,5 +1,7 @@
 import os
+from pyexpat import model
 import sys
+from xml.parsers.expat import model
 
 import numpy as np
 import time
@@ -137,10 +139,30 @@ class Scratch(object):
                         model.item_mat_mf.weight],
                         dim=1
                     ).detach().cpu().clone()
+                elif self.model_type == 'wmf':
+                    best_user_emb = model.user_mat.weight.detach().cpu().clone()
+                    best_item_emb = model.item_mat.weight.detach().cpu().clone()
+                elif self.model_type == 'bpr':
+                    best_user_emb = model.user_mat.weight.detach().cpu().clone()
+                    best_item_emb = model.item_mat.weight.detach().cpu().clone()
+                elif self.model_type == 'dmf':
+                    with torch.no_grad():
+
+                        # all user
+                        user_emb = model.user_mat.weight
+                        item_emb = model.item_mat.weight
+
+                        # MLP
+                        for i in range(len(model.user_fc)):
+                            user_emb = model.user_fc[i](user_emb)
+                            item_emb = model.item_fc[i](item_emb)
+
+                        best_user_emb = user_emb.detach().cpu().clone()
+                        best_item_emb = item_emb.detach().cpu().clone()
             else:
                 count_dec += 1
 
-            if count_dec > 10:
+            if count_dec > 5:
                 break
 
         if active_test_data is not None:
@@ -171,7 +193,7 @@ class Scratch(object):
             print("Best model saved.")
 
         # ===== save best embedding =====
-        if self.model_type == 'neumf' and best_user_emb is not None:
+        if best_user_emb is not None and best_item_emb is not None:
 
             user_dict = {}
             item_dict = {}
