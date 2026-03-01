@@ -79,7 +79,7 @@ def readRating_full_lightgcn(train_dir, test_dir, user_mapping, item_mapping, de
 # =========================================================
 # (RecEraser) Balanced K-means InBP (your version)
 # =========================================================
-def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type, max_iters=30):
+def kmeans_InBP(train_ratings, test_ratings, dataset, num_groups, model_type, max_iters=10):
     """
     Interaction-based Balanced Partition (RecEraser InBP)
     Returns:
@@ -249,7 +249,7 @@ def kmeans_ot_InBP(
     num_groups,
     model_type,
     max_iters=20,
-    reg=5e-2, #unlearn 0 和 5 5e-2; 10 1e-1 or 2e-1
+    reg=2e-1, #unlearn 0 和 5 5e-2; 10 1e-1 or 2e-1
     seed=42,
     verbose=True,
 ):
@@ -711,10 +711,6 @@ def evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, 
 
     return float(np.mean(all_hr)), float(np.mean(all_ndcg))
 
-
-# -----------------------------
-# Training loop: official-style sampling per epoch + neg_k switch
-# -----------------------------
 def train_lightgcn(
     train_edge, test_edge,
     num_users, num_items,
@@ -727,12 +723,12 @@ def train_lightgcn(
     batch_size=1024,
     eval_every=50,
     neg_k=1,
-    eval_mode="sampled",  # "sampled" or "full"
-    learn_type = 'retrain',
-    dataset = 'ml-1m',
+    eval_mode="sampled",
+    learn_type='retrain',
+    dataset='ml-1m',
     seed=42,
 ):
-    
+
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -744,38 +740,33 @@ def train_lightgcn(
 
     adj_norm = build_norm_adj(train_edge, num_users, num_items, device)
 
-    # user pos structures for sampling
     user_pos_lists = build_user_pos_lists(train_edge.cpu(), num_users)
     user_pos_sets = build_user_pos_sets(train_edge.cpu(), num_users)
 
-    # official uses trainDataSize as sampling count per epoch
-    train_size = train_edge.size(1)  # E
+    train_size = train_edge.size(1)
 
-    best_ndcg, best_hr = 0.0, 0.0
+    best_ndcg = 0.0
     t0 = time.time()
 
-    print(f"[Train] edges={train_size} | batch={batch_size} | epochs={epochs} | K={K_layers} | lr={lr} | decay={decay} | neg_k={neg_k} | eval={eval_mode}")
-
     for ep in range(1, epochs + 1):
+
         model.train()
 
-        # 1) sample triples for this epoch (official-style)
+        # 2️⃣ 采样
         u_np, p_np, n_np = uniform_sample_epoch(
-            num_users=num_users,
-            num_items=num_items,
-            train_size=train_size,
-            user_pos_lists=user_pos_lists,
-            user_pos_sets=user_pos_sets,
-            neg_k=neg_k,
+            num_users,
+            num_items,
+            train_size,
+            user_pos_lists,
+            user_pos_sets,
+            neg_k,
             seed=seed + ep,
         )
 
-        # convert to torch
         u = torch.from_numpy(u_np).long().to(device)
         p = torch.from_numpy(p_np).long().to(device)
         n = torch.from_numpy(n_np).long().to(device)
 
-        # shuffle triples
         perm = torch.randperm(u.size(0), device=device)
         u, p, n = u[perm], p[perm], n[perm]
 
@@ -783,14 +774,16 @@ def train_lightgcn(
         steps = 0
 
         for start in range(0, u.size(0), batch_size):
+
             idx = slice(start, start + batch_size)
+
             u_b = u[idx]
             p_b = p[idx]
             n_b = n[idx]
 
             optimizer.zero_grad()
 
-            # forward
+            # ✅ 每个 batch forward 一次
             u_f, u0, i_f, i0 = model(adj_norm)
 
             loss = bpr_loss(
@@ -807,19 +800,18 @@ def train_lightgcn(
 
         epoch_loss /= max(steps, 1)
 
-        if ep == 1 or ep % eval_every == 0:
+        if ep % eval_every == 0:
+
             if eval_mode == "full":
-                hr, ndcg = evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=10, batch_size=256)
+                hr, ndcg = evaluation_full(
+                    model, test_edge, train_edge, adj_norm, num_items
+                )
             else:
-                hr, ndcg = evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=10, neg_num=99, seed=seed)
+                hr, ndcg = evaluation_sampled_1p99n(
+                    model, test_edge, train_edge, adj_norm, num_items
+                )
 
-            dt = time.time() - t0
-            print(f"Epoch {ep:04d} | loss={epoch_loss:.4f} | HR@10={hr:.4f} | NDCG@10={ndcg:.4f} | time={dt/60:.1f}m")
-
-            if ndcg > best_ndcg:
-                best_ndcg, best_hr = ndcg, hr
-                print(f"  >>> New best: NDCG@10={best_ndcg:.4f}, HR@10={best_hr:.4f}")
-        
+            print(f"Epoch {ep} | loss={epoch_loss:.4f} | HR={hr:.4f} | NDCG={ndcg:.4f}")
     # ==============================
     # Save final propagated embeddings
     # ==============================
@@ -1257,7 +1249,7 @@ def RecEraser_FEnsemble(
         device
     )
 
-    # precompute shard embeddings
+    # ===== precompute shard embeddings =====
     shard_user_embs = []
     shard_item_embs = []
 
@@ -1267,7 +1259,19 @@ def RecEraser_FEnsemble(
         shard_user_embs.append(u_final)
         shard_item_embs.append(i_final)
 
-    # build dicts
+    # ===== 聚合所有 item embedding 一次 =====
+    item_embs = []
+    for g in range(len(models)):
+        item_embs.append(shard_item_embs[g].unsqueeze(1))
+
+    item_embs = torch.cat(item_embs, dim=1)  # [I,S,D]
+
+    # dummy user (不会用)
+    dummy_user = torch.zeros_like(item_embs)
+
+    _, i_agg_all = aggregator(dummy_user, item_embs)  # [I,D]
+
+    # ===== build dict =====
     test_dict = {}
     for u, it in zip(test_edge[0].cpu().numpy(),
                      test_edge[1].cpu().numpy()):
@@ -1287,28 +1291,21 @@ def RecEraser_FEnsemble(
 
         u_ids = users[start:start + batch_size]
 
-        # ===== aggregate user embeddings =====
+        # ===== 聚合 user =====
         user_embs = []
         for g in range(len(models)):
-            u_emb = shard_user_embs[g][u_ids]
-            user_embs.append(u_emb.unsqueeze(1))
+            user_embs.append(
+                shard_user_embs[g][u_ids].unsqueeze(1)
+            )
 
         user_embs = torch.cat(user_embs, dim=1)  # [B,S,D]
-        u_agg = aggregator.aggregate_users(user_embs)  # [B,D]
 
-        # ===== aggregate item embeddings (ALL items) =====
-        item_embs = []
-        for g in range(len(models)):
-            item_embs.append(shard_item_embs[g].unsqueeze(0))
+        u_agg, _ = aggregator(user_embs, torch.zeros_like(user_embs))
+        # 只取 user 部分
 
-        item_embs = torch.cat(item_embs, dim=0)  # [S,I,D]
-        item_embs = item_embs.permute(1,0,2)     # [I,S,D]
+        scores = torch.matmul(u_agg, i_agg_all.t())
 
-        i_agg = aggregator.aggregate_items(item_embs)  # [I,D]
-
-        scores = torch.matmul(u_agg, i_agg.t())  # [B,I]
-
-        # mask training items
+        # mask train
         for row_i, u in enumerate(u_ids):
             if u in train_dict:
                 scores[row_i, list(train_dict[u])] = -1e10
@@ -1333,19 +1330,6 @@ def RecEraser_FEnsemble(
 
     return float(np.mean(NDCG)), float(np.mean(HR))
 
-# -------------------------------------------------
-# LR Combiner (β ≥ 0, sum β = 1)
-# -------------------------------------------------
-class LRCombiner(nn.Module):
-    def __init__(self, num_shards):
-        super().__init__()
-        self.raw_beta = nn.Parameter(torch.zeros(num_shards))
-
-    def forward(self, shard_scores):
-        # shard_scores: [B, k]
-        beta = torch.softmax(self.raw_beta, dim=0)  # enforce constraint
-        return torch.sum(beta * shard_scores, dim=1)
-
 # -----------------------------
 # Main
 # -----------------------------
@@ -1356,7 +1340,7 @@ if __name__ == "__main__":
     parser.add_argument('--learn', type=str, default='retrain', help='type of learning and unlearning')
     parser.add_argument("--group", type=int, default=10, help="number of groups for group-based unlearning (only for sisa/receraser/ultrare)")
     parser.add_argument("--delper", type=int, default=0, help="deletion percentage for retrain (0 means no deletion, 100 means all interactions deleted)")
-    parser.add_argument("--epoch", type=int, default=100)
+    parser.add_argument("--epoch", type=int, default=1000)
     parser.add_argument("--embed", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -1368,7 +1352,7 @@ if __name__ == "__main__":
     parser.add_argument("--neg_k", type=int, default=4, help="negative per positive (1 means 1:1, 4 means 1:4)")
 
     # NEW: eval protocol
-    parser.add_argument("--eval_mode", type=str, default="sampled", choices=["sampled", "full"],
+    parser.add_argument("--eval_mode", type=str, default="full", choices=["sampled", "full"],
                         help="sampled = 1 positive + 99 negatives; full = full-ranking")
 
     args = parser.parse_args()
@@ -1594,217 +1578,139 @@ if __name__ == "__main__":
 
 
 '''
-def train_lr_combiner(
-    models,
-    train_edge,
-    num_users,
-    num_items,
+# -----------------------------
+# Training loop: official-style sampling per epoch + neg_k switch
+# -----------------------------
+def train_lightgcn(
+    train_edge, test_edge,
+    num_users, num_items,
     device,
-    epochs=3,
-    batch_size=2048,
-    num_neg=4,
-    lr=1e-2,
+    epochs=1000,
+    embed_dim=64,
+    K_layers=3,
+    lr=1e-3,
+    decay=1e-4,
+    batch_size=1024,
+    eval_every=50,
+    neg_k=1,
+    eval_mode="sampled",  # "sampled" or "full"
+    learn_type = 'retrain',
+    dataset = 'ml-1m',
+    seed=42,
 ):
-    lr_model = LRCombiner(len(models)).to(device)
-    optimizer = torch.optim.Adam(lr_model.parameters(), lr=lr)
-    bce = nn.BCEWithLogitsLoss()
+    
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
+    model = LightGCN(num_users, num_items, embedding_dim=embed_dim, K=K_layers).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    shard_user_embs = []
-    shard_item_embs = []
+    train_edge = train_edge.to(device)
+    test_edge = test_edge.to(device)
 
-    for m in models:
-        m.eval()
-        with torch.no_grad():
-            u_final, _, i_final, _ = m(adj_norm)
-        shard_user_embs.append(u_final)
-        shard_item_embs.append(i_final)
+    adj_norm = build_norm_adj(train_edge, num_users, num_items, device)
 
-    pos_dict = build_user_pos_sets(train_edge, num_users)
+    # user pos structures for sampling
+    user_pos_lists = build_user_pos_lists(train_edge.cpu(), num_users)
+    user_pos_sets = build_user_pos_sets(train_edge.cpu(), num_users)
 
-    users = train_edge[0].cpu().numpy()
-    items = train_edge[1].cpu().numpy()
-    N = len(users)
+    # official uses trainDataSize as sampling count per epoch
+    train_size = train_edge.size(1)  # E
 
-    for ep in range(epochs):
-        perm = np.random.permutation(N)
-        total_loss = 0
+    best_ndcg, best_hr = 0.0, 0.0
+    t0 = time.time()
 
-        for st in range(0, N, batch_size):
-            ed = min(st + batch_size, N)
-            idx = perm[st:ed]
+    print(f"[Train] edges={train_size} | batch={batch_size} | epochs={epochs} | K={K_layers} | lr={lr} | decay={decay} | neg_k={neg_k} | eval={eval_mode}")
 
-            u_batch = users[idx]
-            i_pos = items[idx]
+    for ep in range(1, epochs + 1):
+        model.train()
 
-            u_all, i_all, y_all = [], [], []
+        # 1) sample triples for this epoch (official-style)
+        u_np, p_np, n_np = uniform_sample_epoch(
+            num_users=num_users,
+            num_items=num_items,
+            train_size=train_size,
+            user_pos_lists=user_pos_lists,
+            user_pos_sets=user_pos_sets,
+            neg_k=neg_k,
+            seed=seed + ep,
+        )
 
-            for u, ip in zip(u_batch, i_pos):
-                u_all.append(u)
-                i_all.append(ip)
-                y_all.append(1)
+        # convert to torch
+        u = torch.from_numpy(u_np).long().to(device)
+        p = torch.from_numpy(p_np).long().to(device)
+        n = torch.from_numpy(n_np).long().to(device)
 
-                neg_pool = list(set(range(num_items)) - set(pos_dict[int(u)]))
-                negs = random.sample(neg_pool, num_neg)
-                for ineg in negs:
-                    u_all.append(u)
-                    i_all.append(ineg)
-                    y_all.append(0)
+        # shuffle triples
+        perm = torch.randperm(u.size(0), device=device)
+        u, p, n = u[perm], p[perm], n[perm]
 
-            u_all = torch.tensor(u_all, device=device)
-            i_all = torch.tensor(i_all, device=device)
-            y_all = torch.tensor(y_all, dtype=torch.float32, device=device)
+        epoch_loss = 0.0
+        steps = 0
 
-            shard_scores = []
-            for g in range(len(models)):
-                u_emb = shard_user_embs[g][u_all]
-                i_emb = shard_item_embs[g][i_all]
-                score = torch.sum(u_emb * i_emb, dim=1)
-                shard_scores.append(score.unsqueeze(1))
-
-            X = torch.cat(shard_scores, dim=1)
-
-            logits = lr_model(X)
-            loss = bce(logits, y_all)
+        for start in range(0, u.size(0), batch_size):
+            idx = slice(start, start + batch_size)
+            u_b = u[idx]
+            p_b = p[idx]
+            n_b = n[idx]
 
             optimizer.zero_grad()
+
+            # forward
+            u_f, u0, i_f, i0 = model(adj_norm)
+
+            loss = bpr_loss(
+                u_f[u_b], i_f[p_b], i_f[n_b],
+                u0[u_b], i0[p_b], i0[n_b],
+                decay
+            )
+
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            epoch_loss += float(loss.item())
+            steps += 1
 
-        print(f"[UltraRE LR Epoch {ep+1}] loss={total_loss:.6f}")
+        epoch_loss /= max(steps, 1)
 
-    return lr_model
+        if ep == 1 or ep % eval_every == 0:
+            if eval_mode == "full":
+                hr, ndcg = evaluation_full(model, test_edge, train_edge, adj_norm, num_items, k=10, batch_size=256)
+            else:
+                hr, ndcg = evaluation_sampled_1p99n(model, test_edge, train_edge, adj_norm, num_items, k=10, neg_num=99, seed=seed)
 
-@torch.no_grad()
-def UltraRE_FEnsemble(
-    models,
-    lr_model,
-    train_edge,
-    test_edge,
-    num_users,
-    num_items,
-    device,
-    top_k=10,
-):
-    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
+            dt = time.time() - t0
+            print(f"Epoch {ep:04d} | loss={epoch_loss:.4f} | HR@10={hr:.4f} | NDCG@10={ndcg:.4f} | time={dt/60:.1f}m")
 
-    shard_user_embs, shard_item_embs = [], []
-    for m in models:
-        m.eval()
-        u_final, _, i_final, _ = m(adj_norm)
-        shard_user_embs.append(u_final)
-        shard_item_embs.append(i_final)
+            if ndcg > best_ndcg:
+                best_ndcg, best_hr = ndcg, hr
+                print(f"  >>> New best: NDCG@10={best_ndcg:.4f}, HR@10={best_hr:.4f}")
+        
+    # ==============================
+    # Save final propagated embeddings
+    # ==============================
+    if learn_type == 'retrain':
+        model.eval()
+        with torch.no_grad():
+            u_final, _, i_final, _ = model(adj_norm)
 
-    # build test dict
-    test_dict = {}
-    for u, it in zip(test_edge[0].cpu().numpy(), test_edge[1].cpu().numpy()):
-        test_dict.setdefault(int(u), set()).add(int(it))
+        u_np = u_final.cpu().numpy().astype(np.float32)
+        i_np = i_final.cpu().numpy().astype(np.float32)
 
-    # build train dict
-    train_dict = {}
-    for u, it in zip(train_edge[0].cpu().numpy(), train_edge[1].cpu().numpy()):
-        train_dict.setdefault(int(u), set()).add(int(it))
+        user_dict = {}
+        for uid in range(u_np.shape[0]):
+            user_dict[np.int64(uid)] = u_np[uid:uid+1]
 
-    HR, NDCG = [], []
+        item_dict = {}
+        for iid in range(i_np.shape[0]):
+            item_dict[np.int64(iid)] = i_np[iid:iid+1]
 
-    for u in test_dict.keys():
+        np.save(f"./results/user_emb/{dataset}_lightgcn_user_emb.npy", user_dict)
+        np.save(f"./results/item_emb/{dataset}_lightgcn_item_emb.npy", item_dict)
 
-        shard_scores_list = []
+        print("Final user embeddings saved to user_embedding.npy")
+        print("Final item embeddings saved to item_embedding.npy")
 
-        for g in range(len(models)):
-            user_emb = shard_user_embs[g][u]                    # [d]
-            score_g = torch.matmul(shard_item_embs[g], user_emb)  # [num_items]
-            shard_scores_list.append(score_g.unsqueeze(1))
+    return model
 
-        shard_scores = torch.cat(shard_scores_list, dim=1)  # [num_items, k]
-
-        final_scores = lr_model(shard_scores)  # [num_items]
-
-        # remove training positives
-        if u in train_dict:
-            final_scores[list(train_dict[u])] = -1e10
-
-        _, topk = torch.topk(final_scores, top_k)
-        topk = topk.cpu().numpy()
-
-        targets = test_dict[u]
-        hits = [1 if int(i) in targets else 0 for i in topk]
-
-        HR.append(1.0 if sum(hits) > 0 else 0.0)
-
-        dcg = sum(h / np.log2(idx + 2) for idx, h in enumerate(hits))
-        idcg = sum(1.0 / np.log2(idx + 2)
-                   for idx in range(min(len(targets), top_k)))
-
-        NDCG.append(dcg / idcg if idcg > 0 else 0.0)
-
-    return float(np.mean(NDCG)), float(np.mean(HR))
-
-@torch.no_grad()
-def UltraRE_SEnsemble(
-    models,
-    lr_model,
-    train_edge,
-    test_edge,
-    num_users,
-    num_items,
-    device,
-    pos_dict,
-    top_k=10,
-    num_neg=99,
-):
-    adj_norm = build_norm_adj(train_edge.to(device), num_users, num_items, device)
-
-    shard_user_embs, shard_item_embs = [], []
-    for m in models:
-        m.eval()
-        u_final, _, i_final, _ = m(adj_norm)
-        shard_user_embs.append(u_final)
-        shard_item_embs.append(i_final)
-
-    test_users = test_edge[0].cpu().numpy()
-    test_items = test_edge[1].cpu().numpy()
-
-    HR, NDCG = [], []
-
-    for u, pos_item in zip(test_users, test_items):
-
-        # sample negatives
-        neg_pool = list(set(range(num_items)) - set(pos_dict[int(u)]))
-        neg_items = random.sample(neg_pool, num_neg)
-
-        eval_items = neg_items + [int(pos_item)]
-        eval_items = torch.tensor(eval_items, device=device)
-
-        shard_scores_list = []
-
-        for g in range(len(models)):
-            user_emb = shard_user_embs[g][u]                    # [d]
-            item_emb = shard_item_embs[g][eval_items]           # [100, d]
-            score_g = torch.sum(user_emb * item_emb, dim=1)     # [100]
-            shard_scores_list.append(score_g.unsqueeze(1))
-
-        shard_scores = torch.cat(shard_scores_list, dim=1)  # [100, k]
-
-        final_scores = lr_model(shard_scores)  # [100]
-
-        _, topk = torch.topk(final_scores, top_k)
-        topk = topk.cpu().numpy()
-
-        # ground truth index is always last one
-        gt_index = len(eval_items) - 1
-
-        hits = [1 if i == gt_index else 0 for i in topk]
-
-        HR.append(1.0 if sum(hits) > 0 else 0.0)
-
-        dcg = sum(h / np.log2(idx + 2) for idx, h in enumerate(hits))
-        idcg = 1.0  # only one positive
-
-        NDCG.append(dcg / idcg)
-
-    return float(np.mean(NDCG)), float(np.mean(HR))
 '''
