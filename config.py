@@ -129,7 +129,7 @@ class Instance(object):
                                       self.param.n_worker,
                                       True)
 
-            elif model_type in ['bpr', 'lightgcn']:
+            elif model_type in ['bpr']:
                 train_data = loadData(PairData(train_rating, self.param.pos_data), self.param.batch,
                                       self.param.n_worker,
                                       True)
@@ -171,7 +171,7 @@ class Instance(object):
                     train_data = loadData(RatingData(train_rating[i]), self.param.batch,
                                           self.param.n_worker,
                                           True)
-                elif model_type in ['bpr', 'lightgcn']:
+                elif model_type in ['bpr']:
                     train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
                                           self.param.n_worker,
                                           True)
@@ -224,8 +224,14 @@ class Instance(object):
                             self.param.n_item,
                             self.param.k,
                             self.param.layers)
+                elif model_type == 'wmf':
+                    m = WMF(
+                        self.param.n_user,
+                        self.param.n_item,
+                        self.param.k
+                    )
                 else:
-                    ...
+                    raise NotImplementedError
                 state_dict = torch.load(path, map_location=device, weights_only=True)
                 m.load_state_dict(state_dict)
 
@@ -258,21 +264,26 @@ class Instance(object):
                     train_data = loadData(RatingData(train_rating[i]), self.param.batch,
                                           self.param.n_worker,
                                           True)
-                elif model_type in ['bpr', 'lightgcn']:
+                elif model_type in ['bpr']:
                     train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
                                           self.param.n_worker,
                                           True)
 
                 test_data = loadData(RatingData(test_rating[i]), len(test_rating[i][0]), self.param.n_worker, False)
+
                 if len(active_rating[i][0]) > 0:
                     active_test_data = loadData(RatingData(active_rating[i]), len(active_rating[i][0]),
                                                 self.param.n_worker,
                                                 False)
                 else:
                     active_test_data = None
-                inactive_test_data = loadData(RatingData(inactive_rating[i]), len(inactive_rating[i][0]),
-                                              self.param.n_worker,
-                                              False)
+                
+                if len(inactive_rating[i][0]) > 0:
+                    inactive_test_data = loadData(RatingData(inactive_rating[i]), len(inactive_rating[i][0]),
+                                                  self.param.n_worker,
+                                                  False)
+                else:
+                    inactive_test_data = None
                 
                 model = Scratch(self.param, model_type)
                 #model, result = model.train(train_data,test_data,None,None,verbose)
@@ -312,6 +323,12 @@ class Instance(object):
                         self.param.k,
                         self.param.layers
                     )
+                elif model_type == 'wmf':
+                    m = WMF(
+                        self.param.n_user,
+                        self.param.n_item,
+                        self.param.k
+                    )
                 else:
                     raise NotImplementedError
 
@@ -326,10 +343,20 @@ class Instance(object):
 
             # ========= initialize aggregator =========
             num_shards = len(models)
-            emb_dim = (
-                models[0].user_mat_mlp.weight.shape[1] +
-                models[0].user_mat_mf.weight.shape[1]
-            )
+            if model_type == "neumf":
+                emb_dim = (
+                    models[0].user_mat_mlp.weight.shape[1] +
+                    models[0].user_mat_mf.weight.shape[1]
+                )
+
+            elif model_type in ["wmf", "bpr"]:
+                emb_dim = models[0].user_mat.weight.shape[1]
+
+            elif model_type == "dmf":
+                emb_dim = models[0].layers[-1]   # DMF last layer output as embedding
+
+            else:
+                raise NotImplementedError
 
             aggregator = RecEraserAggregator(
                 emb_dim=emb_dim,
@@ -398,7 +425,7 @@ class Instance(object):
                     train_data = loadData(RatingData(train_rating[i]), self.param.batch,
                                           self.param.n_worker,
                                           True)
-                elif model_type in ['bpr', 'lightgcn']:
+                elif model_type in ['bpr']:
                     train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
                                           self.param.n_worker,
                                           True)
@@ -442,6 +469,7 @@ class Instance(object):
 
             # ==========================
             # UltraRE ensemble testing: load all shard models and test on the full test set (not split by group)
+            # InUltraRE, we use RecEraser aggregation because in the orginal paper, the autho said LR is only efficience than aggregation
             # ==========================
             print("Start UltraRE aggregation...")
 
@@ -455,6 +483,12 @@ class Instance(object):
                         self.param.n_item,
                         self.param.k,
                         self.param.layers
+                    )
+                elif model_type == 'wmf':
+                    m = WMF(
+                        self.param.n_user,
+                        self.param.n_item,
+                        self.param.k
                     )
                 else:
                     raise NotImplementedError
@@ -470,10 +504,20 @@ class Instance(object):
 
             # ========= initialize aggregator =========
             num_shards = len(models)
-            emb_dim = (
-                models[0].user_mat_mlp.weight.shape[1] +
-                models[0].user_mat_mf.weight.shape[1]
-            )
+            if model_type == "neumf":
+                emb_dim = (
+                    models[0].user_mat_mlp.weight.shape[1] +
+                    models[0].user_mat_mf.weight.shape[1]
+                )
+
+            elif model_type in ["wmf", "bpr"]:
+                emb_dim = models[0].user_mat.weight.shape[1]
+
+            elif model_type == "dmf":
+                emb_dim = models[0].layers[-1]   # DMF last layer output as embedding
+
+            else:
+                raise NotImplementedError
 
             aggregator = RecEraserAggregator(
                 emb_dim=emb_dim,
@@ -542,7 +586,7 @@ class Instance(object):
             train_data = loadData(RatingData(train_rating[i]), self.param.batch,
                                 self.param.n_worker,
                                 True)
-        elif model_type in ['bpr', 'lightgcn']:
+        elif model_type in ['bpr']:
             train_data = loadData(PairData(train_rating[i], self.param.pos_data), self.param.batch,
                                 self.param.n_worker,
                                 True)
