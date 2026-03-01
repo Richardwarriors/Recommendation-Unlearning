@@ -5,14 +5,14 @@ import numpy as np
 from config import InsParam, Instance
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', type=str, default='ml-100k', help='dataset name')
-parser.add_argument('--epoch', type=int, default=100, help='number of epochs')
+parser.add_argument('--dataset', type=str, default='ml-1m', help='dataset name')
+parser.add_argument('--epoch', type=int, default=1, help='number of epochs')
 parser.add_argument('--worker', type=int, default=8, help='number of CPU workers')
 parser.add_argument('--verbose', type=int, default=2, help='verbose type')
 parser.add_argument('--group', type=int, default=10, help='number of groups')
 parser.add_argument('--layer', nargs='+', default=[64, 32, 16, 8], help='setting of layers')
 parser.add_argument('--learn', type=str, default='sisa', help='type of learning and unlearning')
-parser.add_argument('--delper', type=int, default=5, help='deleted user proportion')
+parser.add_argument('--delper', type=int, default=0, help='deleted user proportion')
 parser.add_argument('--deltype', type=str, default='random', help='unlearn data selection')
 parser.add_argument('--model', type=str, default='wmf', help='rec model')
 
